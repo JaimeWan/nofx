@@ -86,7 +86,7 @@ func (t *HyperliquidTrader) GetBalance() (map[string]interface{}, error) {
 
 	accountValue, _ := strconv.ParseFloat(accountState.MarginSummary.AccountValue, 64)
 	totalMarginUsed, _ := strconv.ParseFloat(accountState.CrossMarginSummary.TotalMarginUsed, 64)
-	availableBalance, _ := strconv.ParseFloat(accountState.MarginSummary.TotalNtlPos, 64)
+	availableBalance, _ := strconv.ParseFloat(accountState.CrossMarginSummary.AccountValue, 64)
 	// Hyperliquid SDK未提供free collateral字段时，保留占用保证金用于日志
 
 	// ⚠️ 关键修复：从所有持仓中累加真正的未实现盈亏
