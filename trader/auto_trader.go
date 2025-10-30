@@ -29,6 +29,7 @@ type AutoTraderConfig struct {
 
 	// Hyperliquid配置
 	HyperliquidPrivateKey string
+	HyperliquidWalletAddr string
 	HyperliquidTestnet    bool
 
 	// Aster配置
@@ -142,7 +143,7 @@ func NewAutoTrader(config AutoTraderConfig) (*AutoTrader, error) {
 		trader = NewFuturesTrader(config.BinanceAPIKey, config.BinanceSecretKey)
 	case "hyperliquid":
 		log.Printf("🏦 [%s] 使用Hyperliquid交易", config.Name)
-		trader, err = NewHyperliquidTrader(config.HyperliquidPrivateKey, config.HyperliquidTestnet)
+		trader, err = NewHyperliquidTrader(config.HyperliquidPrivateKey, config.HyperliquidWalletAddr, config.HyperliquidTestnet)
 		if err != nil {
 			return nil, fmt.Errorf("初始化Hyperliquid交易器失败: %w", err)
 		}
@@ -513,8 +514,9 @@ func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
 		marginUsedPct = (totalMarginUsed / totalEquity) * 100
 	}
 
-	// 5. 分析历史表现（最近20个周期）
-	performance, err := at.decisionLogger.AnalyzePerformance(20)
+	// 5. 分析历史表现（最近100个周期，避免长期持仓的交易记录丢失）
+	// 假设每3分钟一个周期，100个周期 = 5小时，足够覆盖大部分交易
+	performance, err := at.decisionLogger.AnalyzePerformance(100)
 	if err != nil {
 		log.Printf("⚠️  分析历史表现失败: %v", err)
 		// 不影响主流程，继续执行（但设置performance为nil以避免传递错误数据）
