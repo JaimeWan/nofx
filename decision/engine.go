@@ -292,14 +292,17 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	sb.WriteString(fmt.Sprintf("2. **最多持仓**: %d个币种（质量>数量）\n", maxPositionCount))
 	sb.WriteString(fmt.Sprintf("3. **单币仓位**: 山寨%.0f-%.0f U(%dx杠杆) | BTC/ETH %.0f-%.0f U(%dx杠杆)\n",
 		accountEquity*0.8, accountEquity*1.5, altcoinLeverage, accountEquity*5, accountEquity*10, btcEthLeverage))
-	sb.WriteString("4. **保证金管理**（重要！）：\n")
+	sb.WriteString("4. **保证金管理**（⚠️ 严格约束！）：\n")
 	sb.WriteString("   - 总使用率上限：≤ 90%\n")
 	sb.WriteString(fmt.Sprintf("   - ⚠️ **每笔新开仓**：单笔保证金不应超过账户净值的%.0f%%\n", singleTradeMarginRatio*100))
-	sb.WriteString("   - ⚠️ **关键约束**：单笔保证金绝对不能超过可用余额（AvailableBalance）！\n")
+	sb.WriteString("   - 🚨 **绝对硬约束**：单笔保证金绝对不能超过可用余额（AvailableBalance）！\n")
+	sb.WriteString("   - 📊 **计算公式**：单笔保证金 = position_size_usd / leverage\n")
+	sb.WriteString("   - 🚨 **最大仓位限制**：position_size_usd ≤ 可用余额 × leverage\n")
+	sb.WriteString("   - ⚠️ **必须检查**：开仓前务必确认 (position_size_usd / leverage) ≤ 可用余额\n")
 	sb.WriteString("   - ⚠️ **避免全仓**：不要一次性使用过多保证金，应分散风险\n")
 	sb.WriteString("   - ⚠️ **预留缓冲**：始终保持至少10-20%的可用保证金，以应对波动和追加保证金需求\n")
-	sb.WriteString("   - 📊 **计算方法**：单笔保证金 = position_size_usd / leverage\n")
-	sb.WriteString("   - ⚠️ **必须检查**：开仓前务必确认 position_size_usd / leverage ≤ 可用余额\n\n")
+	sb.WriteString("   - 💡 **示例**：如果可用余额是837.14 USDT，杠杆5倍，则最大仓位 = 837.14 × 5 = 4185.70 USDT\n")
+	sb.WriteString("   - 🚨 **验证失败将被拒绝**：如果保证金超过可用余额，整个决策将被拒绝，必须重新计算\n\n")
 
 	// === 交易哲学 & 最佳实践 ===
 	sb.WriteString("# 🎯 交易哲学 & 最佳实践\n\n")
@@ -468,10 +471,30 @@ func buildUserPrompt(ctx *Context) string {
 		}
 	}
 
-	// 额外提醒：单笔保证金不能超过可用余额
-	if actualAvailableBalance > 0 && actualAvailableBalance < recommendedSingleTradeMargin {
-		sb.WriteString("📌 **重要提醒**: 单笔交易的保证金 = position_size_usd / leverage\n")
-		sb.WriteString(fmt.Sprintf("   请确保 (position_size_usd / leverage) ≤ 可用余额%.2f USDT\n\n", actualAvailableBalance))
+	// 额外提醒：单笔保证金不能超过可用余额（关键约束）
+	if actualAvailableBalance > 0 {
+		sb.WriteString("🚨 **保证金硬约束（必须严格遵守）**:\n")
+		sb.WriteString(fmt.Sprintf("   单笔保证金 = position_size_usd / leverage ≤ %.2f USDT（可用余额）\n", actualAvailableBalance))
+		sb.WriteString(fmt.Sprintf("   最大仓位大小 = %.2f × leverage（可用余额 × 杠杆）\n", actualAvailableBalance))
+
+		// 显示不同杠杆下的最大仓位
+		if actualAvailableBalance < recommendedSingleTradeMargin {
+			sb.WriteString(fmt.Sprintf("   ⚠️ 资金不足：可用余额%.2f < 建议保证金%.0f USDT\n", actualAvailableBalance, recommendedSingleTradeMargin))
+		}
+
+		// BTC/ETH 的最大仓位
+		if ctx.BTCETHLeverage > 0 {
+			maxBTCETHPosition := actualAvailableBalance * float64(ctx.BTCETHLeverage)
+			sb.WriteString(fmt.Sprintf("   BTC/ETH（%dx杠杆）最大仓位 = %.2f × %d = %.2f USDT\n", ctx.BTCETHLeverage, actualAvailableBalance, ctx.BTCETHLeverage, maxBTCETHPosition))
+		}
+
+		// 山寨币的最大仓位
+		if ctx.AltcoinLeverage > 0 {
+			maxAltcoinPosition := actualAvailableBalance * float64(ctx.AltcoinLeverage)
+			sb.WriteString(fmt.Sprintf("   山寨币（%dx杠杆）最大仓位 = %.2f × %d = %.2f USDT\n", ctx.AltcoinLeverage, actualAvailableBalance, ctx.AltcoinLeverage, maxAltcoinPosition))
+		}
+
+		sb.WriteString("   🚨 超过此限制的决策将被系统拒绝！请务必在计算仓位时检查此约束！\n\n")
 	}
 
 	// 持仓（完整市场数据）
