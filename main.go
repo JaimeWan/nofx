@@ -6,6 +6,7 @@ import (
 	"nofx/api"
 	"nofx/config"
 	"nofx/manager"
+	"nofx/market"
 	"nofx/pool"
 	"os"
 	"os/signal"
@@ -37,6 +38,9 @@ func main() {
 	// 设置默认主流币种列表
 	pool.SetDefaultCoins(cfg.DefaultCoins)
 
+	// 设置market包的default_coins
+	market.SetDefaultCoins(cfg.DefaultCoins)
+
 	// 设置是否使用默认主流币种
 	pool.SetUseDefaultCoins(cfg.UseDefaultCoins)
 	if cfg.UseDefaultCoins {
@@ -67,7 +71,9 @@ func main() {
 			cfg.MaxDailyLoss,
 			cfg.MaxDrawdown,
 			cfg.StopTradingMinutes,
-			cfg.Leverage, // 传递杠杆配置
+			cfg.Leverage,               // 传递杠杆配置
+			cfg.MaxPositionCount,       // 最多持仓币种数量
+			cfg.SingleTradeMarginRatio, // 单笔开仓保证金比例
 		)
 		if err != nil {
 			log.Fatalf("❌ 初始化trader失败: %v", err)

@@ -60,6 +60,8 @@
     "btc_eth_leverage": 5,
     "altcoin_leverage": 5
   },
+  "max_position_count": 3,
+  "single_trade_margin_ratio": 0.3,
   "use_default_coins": true,
   "default_coins": [
     "BTCUSDT",

@@ -51,16 +51,18 @@ type LeverageConfig struct {
 
 // Config 总配置
 type Config struct {
-	Traders            []TraderConfig `json:"traders"`
-	UseDefaultCoins    bool           `json:"use_default_coins"` // 是否使用默认主流币种列表
-	DefaultCoins       []string       `json:"default_coins"`     // 默认主流币种池
-	CoinPoolAPIURL     string         `json:"coin_pool_api_url"`
-	OITopAPIURL        string         `json:"oi_top_api_url"`
-	APIServerPort      int            `json:"api_server_port"`
-	MaxDailyLoss       float64        `json:"max_daily_loss"`
-	MaxDrawdown        float64        `json:"max_drawdown"`
-	StopTradingMinutes int            `json:"stop_trading_minutes"`
-	Leverage           LeverageConfig `json:"leverage"` // 杠杆配置
+	Traders                []TraderConfig `json:"traders"`
+	UseDefaultCoins        bool           `json:"use_default_coins"` // 是否使用默认主流币种列表
+	DefaultCoins           []string       `json:"default_coins"`     // 默认主流币种池
+	CoinPoolAPIURL         string         `json:"coin_pool_api_url"`
+	OITopAPIURL            string         `json:"oi_top_api_url"`
+	APIServerPort          int            `json:"api_server_port"`
+	MaxDailyLoss           float64        `json:"max_daily_loss"`
+	MaxDrawdown            float64        `json:"max_drawdown"`
+	StopTradingMinutes     int            `json:"stop_trading_minutes"`
+	Leverage               LeverageConfig `json:"leverage"`                  // 杠杆配置
+	MaxPositionCount       int            `json:"max_position_count"`        // 最多持仓币种数量
+	SingleTradeMarginRatio float64        `json:"single_trade_margin_ratio"` // 单笔开仓保证金比例（0-1）
 }
 
 // LoadConfig 从文件加载配置
@@ -175,6 +177,19 @@ func (c *Config) Validate() error {
 
 	if c.APIServerPort <= 0 {
 		c.APIServerPort = 8080 // 默认8080端口
+	}
+
+	// 设置最多持仓币种数量默认值
+	if c.MaxPositionCount <= 0 {
+		c.MaxPositionCount = 3 // 默认3个币种
+	}
+
+	// 设置单笔开仓保证金比例默认值
+	if c.SingleTradeMarginRatio <= 0 {
+		c.SingleTradeMarginRatio = 0.3 // 默认30%（0.3）
+	}
+	if c.SingleTradeMarginRatio > 1.0 {
+		return fmt.Errorf("single_trade_margin_ratio不能大于1.0（100%%），当前值: %.2f", c.SingleTradeMarginRatio)
 	}
 
 	// 设置杠杆默认值（适配币安子账户限制，最大5倍）

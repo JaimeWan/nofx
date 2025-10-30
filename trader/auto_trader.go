@@ -67,6 +67,10 @@ type AutoTraderConfig struct {
 	MaxDailyLoss    float64       // 最大日亏损百分比（提示）
 	MaxDrawdown     float64       // 最大回撤百分比（提示）
 	StopTradingTime time.Duration // 触发风控后暂停时长
+
+	// 仓位管理配置
+	MaxPositionCount       int     // 最多持仓币种数量
+	SingleTradeMarginRatio float64 // 单笔开仓保证金比例（0-1）
 }
 
 // AutoTrader 自动交易器
@@ -539,11 +543,14 @@ func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
 			MarginUsedPct:    marginUsedPct,
 			PositionCount:    len(positionInfos),
 		},
-		Positions:      positionInfos,
-		CandidateCoins: candidateCoins,
-		Performance:    performance, // 添加历史表现分析
-		CoinWhitelistEnabled: at.config.CoinWhitelistEnabled, // 币种白名单配置
-		CoinWhitelist:        at.config.CoinWhitelist,        // 币种白名单列表
+		Positions:              positionInfos,
+		CandidateCoins:         candidateCoins,
+		Performance:            performance,                      // 添加历史表现分析
+		CoinWhitelistEnabled:   at.config.CoinWhitelistEnabled,   // 币种白名单配置
+		CoinWhitelist:          at.config.CoinWhitelist,          // 币种白名单列表
+		Exchange:               at.exchange,                      // 交易所类型
+		MaxPositionCount:       at.config.MaxPositionCount,       // 最多持仓币种数量
+		SingleTradeMarginRatio: at.config.SingleTradeMarginRatio, // 单笔开仓保证金比例
 	}
 
 	return ctx, nil
@@ -583,7 +590,7 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	}
 
 	// 获取当前价格
-	marketData, err := market.Get(decision.Symbol)
+	marketData, err := market.Get(decision.Symbol, at.exchange)
 	if err != nil {
 		return err
 	}
@@ -636,7 +643,7 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	}
 
 	// 获取当前价格
-	marketData, err := market.Get(decision.Symbol)
+	marketData, err := market.Get(decision.Symbol, at.exchange)
 	if err != nil {
 		return err
 	}
@@ -679,7 +686,7 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 	log.Printf("  🔄 平多仓: %s", decision.Symbol)
 
 	// 获取当前价格
-	marketData, err := market.Get(decision.Symbol)
+	marketData, err := market.Get(decision.Symbol, at.exchange)
 	if err != nil {
 		return err
 	}
@@ -705,7 +712,7 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 	log.Printf("  🔄 平空仓: %s", decision.Symbol)
 
 	// 获取当前价格
-	marketData, err := market.Get(decision.Symbol)
+	marketData, err := market.Get(decision.Symbol, at.exchange)
 	if err != nil {
 		return err
 	}
@@ -754,19 +761,19 @@ func (at *AutoTrader) GetStatus() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"trader_id":       at.id,
-		"trader_name":     at.name,
-		"ai_model":        at.aiModel,
-		"exchange":        at.exchange,
-		"is_running":      at.isRunning,
-		"start_time":      at.startTime.Format(time.RFC3339),
-		"runtime_minutes": int(time.Since(at.startTime).Minutes()),
-		"call_count":      at.callCount,
-		"initial_balance": at.initialBalance,
-		"scan_interval":   at.config.ScanInterval.String(),
-		"stop_until":      at.stopUntil.Format(time.RFC3339),
-		"last_reset_time": at.lastResetTime.Format(time.RFC3339),
-		"ai_provider":     aiProvider,
+		"trader_id":         at.id,
+		"trader_name":       at.name,
+		"ai_model":          at.aiModel,
+		"exchange":          at.exchange,
+		"is_running":        at.isRunning,
+		"start_time":        at.startTime.Format(time.RFC3339),
+		"runtime_minutes":   int(time.Since(at.startTime).Minutes()),
+		"call_count":        at.callCount,
+		"initial_balance":   at.initialBalance,
+		"scan_interval":     at.config.ScanInterval.String(),
+		"stop_until":        at.stopUntil.Format(time.RFC3339),
+		"last_reset_time":   at.lastResetTime.Format(time.RFC3339),
+		"ai_provider":       aiProvider,
 		"whitelist_enabled": at.config.CoinWhitelistEnabled,
 		"whitelist_coins":   at.config.CoinWhitelist,
 	}

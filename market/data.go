@@ -8,7 +8,39 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
+
+// defaultCoins 默认币种列表（从配置读取）
+var defaultCoins = make(map[string]bool)
+
+// hyperliquidOICache Hyperliquid OI数据缓存
+var (
+	hyperliquidOICache     = make(map[string]float64) // symbol -> OI
+	hyperliquidOICacheTime time.Time
+	hyperliquidOICacheMu   sync.RWMutex
+	hyperliquidOICacheTTL  = 30 * time.Second // 缓存30秒
+)
+
+// SetDefaultCoins 设置默认币种列表（从配置读取）
+func SetDefaultCoins(coins []string) {
+	defaultCoins = make(map[string]bool)
+	for _, coin := range coins {
+		normalizedCoin := Normalize(coin)
+		defaultCoins[normalizedCoin] = true
+	}
+}
+
+// isInDefaultCoins 检查币种是否在default_coins中
+func isInDefaultCoins(symbol string) bool {
+	if len(defaultCoins) == 0 {
+		// 如果没有配置default_coins，返回true（向后兼容）
+		return true
+	}
+	normalizedSymbol := Normalize(symbol)
+	return defaultCoins[normalizedSymbol]
+}
 
 // Data 市场数据结构
 type Data struct {
@@ -75,7 +107,7 @@ type Kline struct {
 }
 
 // Get 获取指定代币的市场数据
-func Get(symbol string) (*Data, error) {
+func Get(symbol string, exchange string) (*Data, error) {
 	// 标准化symbol
 	symbol = Normalize(symbol)
 
@@ -116,10 +148,22 @@ func Get(symbol string) (*Data, error) {
 		}
 	}
 
-	// 获取OI数据
-	oiData, err := getOpenInterestData(symbol)
-	if err != nil {
-		// OI失败不影响整体,使用默认值
+	// 获取OI数据（只对default_coins中的币种请求）
+	var oiData *OIData
+	if isInDefaultCoins(symbol) {
+		var err error
+		if exchange == "hyperliquid" {
+			oiData, err = getHyperliquidOpenInterestData(symbol)
+		} else {
+			// 默认使用Binance API
+			oiData, err = getOpenInterestData(symbol)
+		}
+		if err != nil {
+			// OI失败不影响整体,使用默认值
+			oiData = &OIData{Latest: 0, Average: 0}
+		}
+	} else {
+		// 不在default_coins中，不请求OI数据
 		oiData = &OIData{Latest: 0, Average: 0}
 	}
 
@@ -430,6 +474,147 @@ func getOpenInterestData(symbol string) (*OIData, error) {
 	}, nil
 }
 
+// getHyperliquidOpenInterestData 从Hyperliquid获取OI数据
+func getHyperliquidOpenInterestData(symbol string) (*OIData, error) {
+	// 检查缓存是否有效
+	hyperliquidOICacheMu.RLock()
+	cacheValid := time.Since(hyperliquidOICacheTime) < hyperliquidOICacheTTL
+	if cacheValid {
+		if oi, exists := hyperliquidOICache[symbol]; exists {
+			hyperliquidOICacheMu.RUnlock()
+			return &OIData{
+				Latest:  oi,
+				Average: oi * 0.999, // 近似平均值
+			}, nil
+		}
+	}
+	hyperliquidOICacheMu.RUnlock()
+
+	// 缓存失效或不存在，重新获取所有币种的OI数据
+	hyperliquidOICacheMu.Lock()
+	defer hyperliquidOICacheMu.Unlock()
+
+	// 双重检查，可能其他goroutine已经更新了缓存
+	if time.Since(hyperliquidOICacheTime) < hyperliquidOICacheTTL {
+		if oi, exists := hyperliquidOICache[symbol]; exists {
+			return &OIData{
+				Latest:  oi,
+				Average: oi * 0.999,
+			}, nil
+		}
+	}
+
+	// 从Hyperliquid API获取所有币种的OI数据
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	requestBody := map[string]string{
+		"type": "metaAndAssetCtxs",
+	}
+	jsonData, err := json.Marshal(requestBody)
+	if err != nil {
+		return nil, fmt.Errorf("构建请求体失败: %w", err)
+	}
+
+	resp, err := client.Post("https://api.hyperliquid.xyz/info", "application/json", strings.NewReader(string(jsonData)))
+	if err != nil {
+		return nil, fmt.Errorf("请求Hyperliquid OI API失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("读取Hyperliquid OI响应失败: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Hyperliquid OI API返回错误 (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	// 解析API响应
+	var response []interface{}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, fmt.Errorf("Hyperliquid OI JSON解析失败: %w", err)
+	}
+
+	if len(response) < 2 {
+		return nil, fmt.Errorf("Hyperliquid OI响应格式错误")
+	}
+
+	// 解析universe数据
+	universeData, ok := response[0].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("Hyperliquid OI universe数据格式错误")
+	}
+
+	universe, ok := universeData["universe"].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("Hyperliquid OI universe数组格式错误")
+	}
+
+	// 解析assetCtxs数据
+	assetCtxs, ok := response[1].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("Hyperliquid OI assetCtxs数据格式错误")
+	}
+
+	if len(universe) != len(assetCtxs) {
+		return nil, fmt.Errorf("Hyperliquid OI数据长度不匹配")
+	}
+
+	// 更新缓存
+	newCache := make(map[string]float64)
+	for i, universeItem := range universe {
+		universeMap, ok := universeItem.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		assetCtxMap, ok := assetCtxs[i].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		name, ok := universeMap["name"].(string)
+		if !ok {
+			continue
+		}
+
+		openInterest, ok := assetCtxMap["openInterest"].(string)
+		if !ok {
+			continue
+		}
+
+		oi, err := strconv.ParseFloat(openInterest, 64)
+		if err != nil {
+			continue
+		}
+
+		// 转换为USDT交易对格式
+		symbolHL := name + "USDT"
+		symbolHL = Normalize(symbolHL)
+		newCache[symbolHL] = oi
+	}
+
+	hyperliquidOICache = newCache
+	hyperliquidOICacheTime = time.Now()
+
+	// 查找目标币种的OI
+	if oi, exists := hyperliquidOICache[symbol]; exists {
+		return &OIData{
+			Latest:  oi,
+			Average: oi * 0.999,
+		}, nil
+	}
+
+	// 未找到该币种，返回0
+	return &OIData{
+		Latest:  0,
+		Average: 0,
+	}, nil
+}
+
 // getFundingRate 获取资金费率
 func getFundingRate(symbol string) (float64, error) {
 	url := fmt.Sprintf("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=%s", symbol)
@@ -474,8 +659,10 @@ func Format(data *Data) string {
 		data.Symbol))
 
 	if data.OpenInterest != nil {
-		sb.WriteString(fmt.Sprintf("Open Interest: Latest: %.2f Average: %.2f\n\n",
-			data.OpenInterest.Latest, data.OpenInterest.Average))
+		// 显示原始OI数量和USD价值
+		oiValueUSD := data.OpenInterest.Latest * data.CurrentPrice
+		sb.WriteString(fmt.Sprintf("Open Interest: Latest: %.2f (数量) | Value: %.2f USD (数量 × 价格) | Average: %.2f\n\n",
+			data.OpenInterest.Latest, oiValueUSD, data.OpenInterest.Average))
 	}
 
 	sb.WriteString(fmt.Sprintf("Funding Rate: %.2e\n\n", data.FundingRate))
@@ -483,27 +670,27 @@ func Format(data *Data) string {
 	// 添加OI Top数据
 	if data.OITopData != nil {
 		sb.WriteString("OI Top Data (持仓量分析):\n\n")
-		
+
 		if data.OITopData.Rank > 0 {
 			sb.WriteString(fmt.Sprintf("Rank: #%d\n", data.OITopData.Rank))
 		}
-		
+
 		if data.OITopData.OIDeltaValue > 0 {
 			sb.WriteString(fmt.Sprintf("OI Value: %.2f\n", data.OITopData.OIDeltaValue))
 		}
-		
+
 		if data.OITopData.OIDeltaPercent != 0 {
 			sb.WriteString(fmt.Sprintf("OI Change: %.2f%%\n", data.OITopData.OIDeltaPercent))
 		}
-		
+
 		if data.OITopData.PriceDeltaPercent != 0 {
 			sb.WriteString(fmt.Sprintf("Price Change: %.2f%%\n", data.OITopData.PriceDeltaPercent))
 		}
-		
+
 		if data.OITopData.NetLong > 0 || data.OITopData.NetShort > 0 {
 			sb.WriteString(fmt.Sprintf("Net Long: %.2f | Net Short: %.2f\n", data.OITopData.NetLong, data.OITopData.NetShort))
 		}
-		
+
 		sb.WriteString("\n")
 	}
 

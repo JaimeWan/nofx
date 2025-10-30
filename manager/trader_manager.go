@@ -23,7 +23,7 @@ func NewTraderManager() *TraderManager {
 }
 
 // AddTrader 添加一个trader
-func (tm *TraderManager) AddTrader(cfg config.TraderConfig, coinPoolURL string, maxDailyLoss, maxDrawdown float64, stopTradingMinutes int, leverage config.LeverageConfig) error {
+func (tm *TraderManager) AddTrader(cfg config.TraderConfig, coinPoolURL string, maxDailyLoss, maxDrawdown float64, stopTradingMinutes int, leverage config.LeverageConfig, maxPositionCount int, singleTradeMarginRatio float64) error {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -33,32 +33,34 @@ func (tm *TraderManager) AddTrader(cfg config.TraderConfig, coinPoolURL string, 
 
 	// 构建AutoTraderConfig
 	traderConfig := trader.AutoTraderConfig{
-		ID:                    cfg.ID,
-		Name:                  cfg.Name,
-		AIModel:               cfg.AIModel,
-		Exchange:              cfg.Exchange,
-		BinanceAPIKey:         cfg.BinanceAPIKey,
-		BinanceSecretKey:      cfg.BinanceSecretKey,
-		HyperliquidPrivateKey: cfg.HyperliquidPrivateKey,
-		HyperliquidWalletAddr: cfg.HyperliquidWalletAddr,
-		HyperliquidTestnet:    cfg.HyperliquidTestnet,
-		AsterUser:             cfg.AsterUser,
-		AsterSigner:           cfg.AsterSigner,
-		AsterPrivateKey:       cfg.AsterPrivateKey,
-		CoinPoolAPIURL:        coinPoolURL,
-		UseQwen:               cfg.AIModel == "qwen",
-		DeepSeekKey:           cfg.DeepSeekKey,
-		QwenKey:               cfg.QwenKey,
-		CustomAPIURL:          cfg.CustomAPIURL,
-		CustomAPIKey:          cfg.CustomAPIKey,
-		CustomModelName:       cfg.CustomModelName,
-		ScanInterval:          cfg.GetScanInterval(),
-		InitialBalance:        cfg.InitialBalance,
-		BTCETHLeverage:        leverage.BTCETHLeverage,  // 使用配置的杠杆倍数
-		AltcoinLeverage:       leverage.AltcoinLeverage, // 使用配置的杠杆倍数
-		MaxDailyLoss:          maxDailyLoss,
-		MaxDrawdown:           maxDrawdown,
-		StopTradingTime:       time.Duration(stopTradingMinutes) * time.Minute,
+		ID:                     cfg.ID,
+		Name:                   cfg.Name,
+		AIModel:                cfg.AIModel,
+		Exchange:               cfg.Exchange,
+		BinanceAPIKey:          cfg.BinanceAPIKey,
+		BinanceSecretKey:       cfg.BinanceSecretKey,
+		HyperliquidPrivateKey:  cfg.HyperliquidPrivateKey,
+		HyperliquidWalletAddr:  cfg.HyperliquidWalletAddr,
+		HyperliquidTestnet:     cfg.HyperliquidTestnet,
+		AsterUser:              cfg.AsterUser,
+		AsterSigner:            cfg.AsterSigner,
+		AsterPrivateKey:        cfg.AsterPrivateKey,
+		CoinPoolAPIURL:         coinPoolURL,
+		UseQwen:                cfg.AIModel == "qwen",
+		DeepSeekKey:            cfg.DeepSeekKey,
+		QwenKey:                cfg.QwenKey,
+		CustomAPIURL:           cfg.CustomAPIURL,
+		CustomAPIKey:           cfg.CustomAPIKey,
+		CustomModelName:        cfg.CustomModelName,
+		ScanInterval:           cfg.GetScanInterval(),
+		InitialBalance:         cfg.InitialBalance,
+		BTCETHLeverage:         leverage.BTCETHLeverage,  // 使用配置的杠杆倍数
+		AltcoinLeverage:        leverage.AltcoinLeverage, // 使用配置的杠杆倍数
+		MaxDailyLoss:           maxDailyLoss,
+		MaxDrawdown:            maxDrawdown,
+		StopTradingTime:        time.Duration(stopTradingMinutes) * time.Minute,
+		MaxPositionCount:       maxPositionCount,       // 最多持仓币种数量
+		SingleTradeMarginRatio: singleTradeMarginRatio, // 单笔开仓保证金比例
 	}
 
 	// 创建trader实例

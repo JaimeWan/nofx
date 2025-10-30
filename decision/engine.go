@@ -6,7 +6,6 @@ import (
 	"log"
 	"nofx/market"
 	"nofx/mcp"
-	"nofx/pool"
 	"strings"
 	"time"
 )
@@ -55,19 +54,22 @@ type OITopData struct {
 
 // Context 交易上下文（传递给AI的完整信息）
 type Context struct {
-	CurrentTime     string                  `json:"current_time"`
-	RuntimeMinutes  int                     `json:"runtime_minutes"`
-	CallCount       int                     `json:"call_count"`
-	Account         AccountInfo             `json:"account"`
-	Positions       []PositionInfo          `json:"positions"`
-	CandidateCoins  []CandidateCoin         `json:"candidate_coins"`
-	MarketDataMap   map[string]*market.Data `json:"-"` // 不序列化，但内部使用
-	OITopDataMap    map[string]*market.OITopData   `json:"-"` // OI Top数据映射
-	Performance     interface{}             `json:"-"` // 历史表现分析（logger.PerformanceAnalysis）
-	BTCETHLeverage  int                     `json:"-"` // BTC/ETH杠杆倍数（从配置读取）
-	AltcoinLeverage int                     `json:"-"` // 山寨币杠杆倍数（从配置读取）
-	CoinWhitelistEnabled bool               `json:"-"` // 是否启用币种白名单
-	CoinWhitelist        []string           `json:"-"` // 币种白名单列表
+	CurrentTime            string                       `json:"current_time"`
+	RuntimeMinutes         int                          `json:"runtime_minutes"`
+	CallCount              int                          `json:"call_count"`
+	Account                AccountInfo                  `json:"account"`
+	Positions              []PositionInfo               `json:"positions"`
+	CandidateCoins         []CandidateCoin              `json:"candidate_coins"`
+	MarketDataMap          map[string]*market.Data      `json:"-"` // 不序列化，但内部使用
+	OITopDataMap           map[string]*market.OITopData `json:"-"` // OI Top数据映射
+	Performance            interface{}                  `json:"-"` // 历史表现分析（logger.PerformanceAnalysis）
+	BTCETHLeverage         int                          `json:"-"` // BTC/ETH杠杆倍数（从配置读取）
+	AltcoinLeverage        int                          `json:"-"` // 山寨币杠杆倍数（从配置读取）
+	CoinWhitelistEnabled   bool                         `json:"-"` // 是否启用币种白名单
+	CoinWhitelist          []string                     `json:"-"` // 币种白名单列表
+	Exchange               string                       `json:"-"` // 交易所类型: "binance", "hyperliquid", "aster"
+	MaxPositionCount       int                          `json:"-"` // 最多持仓币种数量
+	SingleTradeMarginRatio float64                      `json:"-"` // 单笔开仓保证金比例（0-1）
 }
 
 // Decision AI的交易决策
@@ -99,7 +101,7 @@ func GetFullDecision(ctx *Context, mcpClient *mcp.Client) (*FullDecision, error)
 	}
 
 	// 2. 构建 System Prompt（固定规则）和 User Prompt（动态数据）
-	systemPrompt := buildSystemPrompt(ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage)
+	systemPrompt := buildSystemPrompt(ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage, ctx.MaxPositionCount, ctx.SingleTradeMarginRatio)
 	userPrompt := buildUserPrompt(ctx)
 
 	// 3. 调用AI API（使用 system + user prompt）
@@ -109,7 +111,7 @@ func GetFullDecision(ctx *Context, mcpClient *mcp.Client) (*FullDecision, error)
 	}
 
 	// 4. 解析AI响应
-	decision, err := parseFullDecisionResponse(aiResponse, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage)
+	decision, err := parseFullDecisionResponse(aiResponse, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage, ctx.Account.AvailableBalance)
 	if err != nil {
 		return nil, fmt.Errorf("解析AI响应失败: %w", err)
 	}
@@ -138,7 +140,7 @@ func fetchMarketDataForContext(ctx *Context) error {
 		if i >= maxCandidates {
 			break
 		}
-		
+
 		// 应用白名单过滤
 		if ctx.CoinWhitelistEnabled {
 			if !isCoinInWhitelist(coin.Symbol, ctx.CoinWhitelist) {
@@ -146,7 +148,7 @@ func fetchMarketDataForContext(ctx *Context) error {
 				continue
 			}
 		}
-		
+
 		symbolSet[coin.Symbol] = true
 	}
 
@@ -158,7 +160,7 @@ func fetchMarketDataForContext(ctx *Context) error {
 	}
 
 	for symbol := range symbolSet {
-		data, err := market.Get(symbol)
+		data, err := market.Get(symbol, ctx.Exchange)
 		if err != nil {
 			// 单个币种失败不影响整体，只记录错误
 			continue
@@ -182,63 +184,67 @@ func fetchMarketDataForContext(ctx *Context) error {
 		ctx.MarketDataMap[symbol] = data
 	}
 
-	// 加载OI Top数据（不影响主流程）
-	oiPositions, err := pool.GetOITopPositions()
-	if err == nil {
-		for _, pos := range oiPositions {
-			// 标准化符号匹配
-			symbol := pos.Symbol
-			oiData := &market.OITopData{
-				Rank:              pos.Rank,
-				OIDeltaPercent:    pos.OIDeltaPercent,
-				OIDeltaValue:      pos.OIDeltaValue,
-				PriceDeltaPercent: pos.PriceDeltaPercent,
-				NetLong:           pos.NetLong,
-				NetShort:          pos.NetShort,
-			}
-			ctx.OITopDataMap[symbol] = oiData
-			
-			// 将OI Top数据添加到对应的MarketData中
-			if marketData, exists := ctx.MarketDataMap[symbol]; exists {
-				marketData.OITopData = oiData
-			}
-		}
-	}
+	// OI Top数据已禁用，暂时不使用
+	// 如需启用，请取消以下注释
+	/*
+		// 加载OI Top数据（不影响主流程）
+		oiPositions, err := pool.GetOITopPositions()
+		if err == nil {
+			for _, pos := range oiPositions {
+				// 标准化符号匹配
+				symbol := pos.Symbol
+				oiData := &market.OITopData{
+					Rank:              pos.Rank,
+					OIDeltaPercent:    pos.OIDeltaPercent,
+					OIDeltaValue:      pos.OIDeltaValue,
+					PriceDeltaPercent: pos.PriceDeltaPercent,
+					NetLong:           pos.NetLong,
+					NetShort:          pos.NetShort,
+				}
+				ctx.OITopDataMap[symbol] = oiData
 
-	// 加载Hyperliquid OI数据（不影响主流程）
-	hyperliquidOIPositions, err := pool.GetHyperliquidOIData()
-	if err == nil {
-		for _, pos := range hyperliquidOIPositions {
-			// 检查是否在白名单中
-			if ctx.CoinWhitelistEnabled {
-				if !isCoinInWhitelist(pos.Symbol, ctx.CoinWhitelist) {
-					continue
+				// 将OI Top数据添加到对应的MarketData中
+				if marketData, exists := ctx.MarketDataMap[symbol]; exists {
+					marketData.OITopData = oiData
 				}
 			}
-			
-			// 添加到OI Top数据映射中（使用Hyperliquid数据）
-			// 将OI转换为USD：OI * 当前价格
-			oiValueUSD := pos.OI
-			if marketData, exists := ctx.MarketDataMap[pos.Symbol]; exists && marketData.CurrentPrice > 0 {
-				oiValueUSD = pos.OI * marketData.CurrentPrice
-			}
-			
-			oiData := &market.OITopData{
-				Rank:              0, // Hyperliquid数据没有排名
-				OIDeltaPercent:    0, // Hyperliquid数据没有变化百分比
-				OIDeltaValue:      oiValueUSD, // 使用转换为USD的OI值
-				PriceDeltaPercent: 0, // Hyperliquid数据没有价格变化
-				NetLong:           0, // Hyperliquid数据没有净多空
-				NetShort:          0,
-			}
-			ctx.OITopDataMap[pos.Symbol] = oiData
-			
-			// 将Hyperliquid OI数据添加到对应的MarketData中
-			if marketData, exists := ctx.MarketDataMap[pos.Symbol]; exists {
-				marketData.OITopData = oiData
+		}
+
+		// 加载Hyperliquid OI数据（不影响主流程）
+		hyperliquidOIPositions, err := pool.GetHyperliquidOIData()
+		if err == nil {
+			for _, pos := range hyperliquidOIPositions {
+				// 检查是否在白名单中
+				if ctx.CoinWhitelistEnabled {
+					if !isCoinInWhitelist(pos.Symbol, ctx.CoinWhitelist) {
+						continue
+					}
+				}
+
+				// 添加到OI Top数据映射中（使用Hyperliquid数据）
+				// 将OI转换为USD：OI * 当前价格
+				oiValueUSD := pos.OI
+				if marketData, exists := ctx.MarketDataMap[pos.Symbol]; exists && marketData.CurrentPrice > 0 {
+					oiValueUSD = pos.OI * marketData.CurrentPrice
+				}
+
+				oiData := &market.OITopData{
+					Rank:              0, // Hyperliquid数据没有排名
+					OIDeltaPercent:    0, // Hyperliquid数据没有变化百分比
+					OIDeltaValue:      oiValueUSD, // 使用转换为USD的OI值
+					PriceDeltaPercent: 0, // Hyperliquid数据没有价格变化
+					NetLong:           0, // Hyperliquid数据没有净多空
+					NetShort:          0,
+				}
+				ctx.OITopDataMap[pos.Symbol] = oiData
+
+				// 将Hyperliquid OI数据添加到对应的MarketData中
+				if marketData, exists := ctx.MarketDataMap[pos.Symbol]; exists {
+					marketData.OITopData = oiData
+				}
 			}
 		}
-	}
+	*/
 
 	return nil
 }
@@ -262,7 +268,7 @@ func isCoinInWhitelist(coin string, whitelist []string) bool {
 }
 
 // buildSystemPrompt 构建 System Prompt（固定规则，可缓存）
-func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage int) string {
+func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage int, maxPositionCount int, singleTradeMarginRatio float64) string {
 	var sb strings.Builder
 
 	// === 核心使命 ===
@@ -283,10 +289,17 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	// === 硬约束（风险控制）===
 	sb.WriteString("# ⚖️ 硬约束（风险控制）\n\n")
 	sb.WriteString("1. **风险回报比**: 必须 ≥ 1:3（冒1%风险，赚3%+收益）\n")
-	sb.WriteString("2. **最多持仓**: 3个币种（质量>数量）\n")
+	sb.WriteString(fmt.Sprintf("2. **最多持仓**: %d个币种（质量>数量）\n", maxPositionCount))
 	sb.WriteString(fmt.Sprintf("3. **单币仓位**: 山寨%.0f-%.0f U(%dx杠杆) | BTC/ETH %.0f-%.0f U(%dx杠杆)\n",
 		accountEquity*0.8, accountEquity*1.5, altcoinLeverage, accountEquity*5, accountEquity*10, btcEthLeverage))
-	sb.WriteString("4. **保证金**: 总使用率 ≤ 90%\n\n")
+	sb.WriteString("4. **保证金管理**（重要！）：\n")
+	sb.WriteString("   - 总使用率上限：≤ 90%\n")
+	sb.WriteString(fmt.Sprintf("   - ⚠️ **每笔新开仓**：单笔保证金不应超过账户净值的%.0f%%\n", singleTradeMarginRatio*100))
+	sb.WriteString("   - ⚠️ **关键约束**：单笔保证金绝对不能超过可用余额（AvailableBalance）！\n")
+	sb.WriteString("   - ⚠️ **避免全仓**：不要一次性使用过多保证金，应分散风险\n")
+	sb.WriteString("   - ⚠️ **预留缓冲**：始终保持至少10-20%的可用保证金，以应对波动和追加保证金需求\n")
+	sb.WriteString("   - 📊 **计算方法**：单笔保证金 = position_size_usd / leverage\n")
+	sb.WriteString("   - ⚠️ **必须检查**：开仓前务必确认 position_size_usd / leverage ≤ 可用余额\n\n")
 
 	// === 交易哲学 & 最佳实践 ===
 	sb.WriteString("# 🎯 交易哲学 & 最佳实践\n\n")
@@ -308,7 +321,8 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	sb.WriteString("**量化标准**:\n")
 	sb.WriteString("- 优秀交易员：每天2-4笔 = 每小时0.1-0.2笔\n")
 	sb.WriteString("- 过度交易：每小时>2笔 = 严重问题\n")
-	sb.WriteString("- 最佳节奏：开仓后持有至少30-60分钟\n\n")
+	// 这里原本写的30-60分钟，感觉会使llm误以为60分钟后就可以平仓
+	sb.WriteString("- 最佳节奏：开仓后持有至少30分钟以上\n\n")
 	sb.WriteString("**自查**:\n")
 	sb.WriteString("如果你发现自己每个周期都在交易 → 说明标准太低\n")
 	sb.WriteString("如果你发现持仓<30分钟就平仓 → 说明太急躁\n\n")
@@ -398,7 +412,7 @@ func buildUserPrompt(ctx *Context) string {
 	// 系统状态
 	sb.WriteString(fmt.Sprintf("**时间**: %s | **周期**: #%d | **运行**: %d分钟\n\n",
 		ctx.CurrentTime, ctx.CallCount, ctx.RuntimeMinutes))
-	
+
 	// 白名单状态
 	if ctx.CoinWhitelistEnabled {
 		sb.WriteString(fmt.Sprintf("**币种白名单**: 已启用，仅交易以下%d个币种: %s\n\n",
@@ -422,6 +436,43 @@ func buildUserPrompt(ctx *Context) string {
 		ctx.Account.TotalPnLPct,
 		ctx.Account.MarginUsedPct,
 		ctx.Account.PositionCount))
+
+	// 保证金使用建议
+	availableMarginPct := 100.0 - ctx.Account.MarginUsedPct
+	recommendedSingleTradeMargin := ctx.Account.TotalEquity * ctx.SingleTradeMarginRatio // 使用配置的比例
+	actualAvailableBalance := ctx.Account.AvailableBalance                               // 实际可用余额
+
+	// 检查可用余额是否足够支付建议的保证金
+	if actualAvailableBalance < recommendedSingleTradeMargin {
+		// 可用余额不足，使用实际可用余额作为上限
+		if actualAvailableBalance > 0 {
+			sb.WriteString(fmt.Sprintf("⚠️ **资金不足警告**: 当前可用余额%.2f USDT < 建议保证金%.0f USDT！\n",
+				actualAvailableBalance, recommendedSingleTradeMargin))
+			sb.WriteString(fmt.Sprintf("   单笔新开仓保证金不能超过可用余额%.2f USDT，否则将无法开仓！\n", actualAvailableBalance))
+			sb.WriteString("   建议：优先平仓释放保证金，或等待账户余额增加后再开仓\n\n")
+		} else {
+			sb.WriteString(fmt.Sprintf("🚨 **资金严重不足**: 当前可用余额为0或负数（%.2f USDT）！\n", actualAvailableBalance))
+			sb.WriteString("   无法开任何新仓，必须优先平仓释放保证金！\n\n")
+		}
+	} else {
+		// 可用余额充足，按正常逻辑显示
+		if ctx.Account.MarginUsedPct < 70 {
+			sb.WriteString(fmt.Sprintf("💡 **保证金建议**: 当前可用%.1f%% | 可用余额%.2f USDT | 单笔新开仓建议保证金≤%.0f USDT（账户净值的%.0f%%）\n\n",
+				availableMarginPct, actualAvailableBalance, recommendedSingleTradeMargin, ctx.SingleTradeMarginRatio*100))
+		} else if ctx.Account.MarginUsedPct < 85 {
+			sb.WriteString(fmt.Sprintf("⚠️ **保证金警告**: 当前已使用%.1f%%，接近上限！可用余额%.2f USDT | 单笔新开仓建议保证金≤%.0f USDT（账户净值的%.0f%%）\n\n",
+				ctx.Account.MarginUsedPct, actualAvailableBalance, recommendedSingleTradeMargin, ctx.SingleTradeMarginRatio*100))
+		} else {
+			sb.WriteString(fmt.Sprintf("🚨 **保证金警报**: 当前已使用%.1f%%，接近90%%上限！可用余额%.2f USDT | 强烈建议暂停新开仓，优先考虑平仓或等待\n\n",
+				ctx.Account.MarginUsedPct, actualAvailableBalance))
+		}
+	}
+
+	// 额外提醒：单笔保证金不能超过可用余额
+	if actualAvailableBalance > 0 && actualAvailableBalance < recommendedSingleTradeMargin {
+		sb.WriteString("📌 **重要提醒**: 单笔交易的保证金 = position_size_usd / leverage\n")
+		sb.WriteString(fmt.Sprintf("   请确保 (position_size_usd / leverage) ≤ 可用余额%.2f USDT\n\n", actualAvailableBalance))
+	}
 
 	// 持仓（完整市场数据）
 	if len(ctx.Positions) > 0 {
@@ -472,7 +523,7 @@ func buildUserPrompt(ctx *Context) string {
 		} else if len(coin.Sources) == 1 && coin.Sources[0] == "oi_top" {
 			sourceTags = " (OI_Top持仓增长)"
 		}
-		
+
 		// 检查是否有Hyperliquid OI数据
 		if oiData, hasOIData := ctx.OITopDataMap[coin.Symbol]; hasOIData && oiData.OIDeltaValue > 0 {
 			if sourceTags == "" {
@@ -510,7 +561,7 @@ func buildUserPrompt(ctx *Context) string {
 }
 
 // parseFullDecisionResponse 解析AI的完整决策响应
-func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthLeverage, altcoinLeverage int) (*FullDecision, error) {
+func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthLeverage, altcoinLeverage int, availableBalance float64) (*FullDecision, error) {
 	// 1. 提取思维链
 	cotTrace := extractCoTTrace(aiResponse)
 
@@ -524,7 +575,7 @@ func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthL
 	}
 
 	// 3. 验证决策
-	if err := validateDecisions(decisions, accountEquity, btcEthLeverage, altcoinLeverage); err != nil {
+	if err := validateDecisions(decisions, accountEquity, btcEthLeverage, altcoinLeverage, availableBalance); err != nil {
 		return &FullDecision{
 			CoTTrace:  cotTrace,
 			Decisions: decisions,
@@ -592,9 +643,9 @@ func fixMissingQuotes(jsonStr string) string {
 }
 
 // validateDecisions 验证所有决策（需要账户信息和杠杆配置）
-func validateDecisions(decisions []Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int) error {
+func validateDecisions(decisions []Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int, availableBalance float64) error {
 	for i, decision := range decisions {
-		if err := validateDecision(&decision, accountEquity, btcEthLeverage, altcoinLeverage); err != nil {
+		if err := validateDecision(&decision, accountEquity, btcEthLeverage, altcoinLeverage, availableBalance); err != nil {
 			return fmt.Errorf("决策 #%d 验证失败: %w", i+1, err)
 		}
 	}
@@ -624,7 +675,7 @@ func findMatchingBracket(s string, start int) int {
 }
 
 // validateDecision 验证单个决策的有效性
-func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int) error {
+func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int, availableBalance float64) error {
 	// 验证action
 	validActions := map[string]bool{
 		"open_long":   true,
@@ -655,6 +706,17 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 		if d.PositionSizeUSD <= 0 {
 			return fmt.Errorf("仓位大小必须大于0: %.2f", d.PositionSizeUSD)
 		}
+
+		// 验证保证金不超过可用余额（关键约束）
+		requiredMargin := d.PositionSizeUSD / float64(d.Leverage)
+		if requiredMargin > availableBalance {
+			return fmt.Errorf("保证金不足：所需保证金%.2f USDT（仓位%.2f / 杠杆%d）超过可用余额%.2f USDT",
+				requiredMargin, d.PositionSizeUSD, d.Leverage, availableBalance)
+		}
+		if availableBalance <= 0 {
+			return fmt.Errorf("可用余额不足：当前可用余额为%.2f USDT，无法开仓", availableBalance)
+		}
+
 		// 验证仓位价值上限（加1%容差以避免浮点数精度问题）
 		tolerance := maxPositionValue * 0.01 // 1%容差
 		if d.PositionSizeUSD > maxPositionValue+tolerance {

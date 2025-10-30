@@ -15,8 +15,8 @@ import (
 
 // HyperliquidOIData Hyperliquid OI数据结构
 type HyperliquidOIData struct {
-	Name string  `json:"name"`
-	OI   string  `json:"oi"`
+	Name string `json:"name"`
+	OI   string `json:"oi"`
 }
 
 // HyperliquidOIPosition Hyperliquid OI持仓数据
@@ -43,44 +43,9 @@ var hyperliquidOIConfig = struct {
 	CacheDir: "coin_pool_cache",
 }
 
-// GetHyperliquidOIData 获取Hyperliquid OI数据
+// GetHyperliquidOIData 获取Hyperliquid OI数据（已禁用，暂时不使用）
 func GetHyperliquidOIData() ([]HyperliquidOIPosition, error) {
-	maxRetries := 3
-	var lastErr error
-
-	// 尝试从API获取
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		if attempt > 1 {
-			log.Printf("⚠️  第%d次重试获取Hyperliquid OI数据（共%d次）...", attempt, maxRetries)
-			time.Sleep(2 * time.Second)
-		}
-
-		positions, err := fetchHyperliquidOI()
-		if err == nil {
-			if attempt > 1 {
-				log.Printf("✓ 第%d次重试成功", attempt)
-			}
-			// 成功获取后保存到缓存
-			if err := saveHyperliquidOICache(positions); err != nil {
-				log.Printf("⚠️  保存Hyperliquid OI缓存失败: %v", err)
-			}
-			return positions, nil
-		}
-
-		lastErr = err
-		log.Printf("❌ 第%d次请求Hyperliquid OI失败: %v", attempt, err)
-	}
-
-	// API获取失败，尝试使用缓存
-	log.Printf("⚠️  Hyperliquid OI API请求全部失败，尝试使用历史缓存数据...")
-	cachedPositions, err := loadHyperliquidOICache()
-	if err == nil {
-		log.Printf("✓ 使用历史Hyperliquid OI缓存数据（共%d个币种）", len(cachedPositions))
-		return cachedPositions, nil
-	}
-
-	// 缓存也失败，返回空列表
-	log.Printf("⚠️  无法加载Hyperliquid OI缓存数据（最后错误: %v），跳过Hyperliquid OI数据", lastErr)
+	// Hyperliquid OI功能已暂时禁用，直接返回空列表
 	return []HyperliquidOIPosition{}, nil
 }
 
@@ -248,4 +213,36 @@ func loadHyperliquidOICache() ([]HyperliquidOIPosition, error) {
 	}
 
 	return cache.Positions, nil
+}
+
+// filterHyperliquidByDefaultCoins 过滤Hyperliquid OI数据，只返回default_coins中的币种
+func filterHyperliquidByDefaultCoins(positions []HyperliquidOIPosition) []HyperliquidOIPosition {
+	// 由于coin_pool.go和hyperliquid_oi.go在同一个pool包中，可以直接访问defaultMainstreamCoins
+	// 但需要导入coin_pool.go中的normalizeSymbol函数，或者在这里实现相同的逻辑
+	if len(defaultMainstreamCoins) == 0 {
+		// 如果没有配置default_coins，返回全部
+		return positions
+	}
+
+	// 创建default_coins的map用于快速查找
+	defaultCoinsMap := make(map[string]bool)
+	for _, coin := range defaultMainstreamCoins {
+		normalizedCoin := normalizeSymbol(coin)
+		defaultCoinsMap[normalizedCoin] = true
+	}
+
+	var filtered []HyperliquidOIPosition
+	for _, pos := range positions {
+		normalizedSymbol := normalizeSymbol(pos.Symbol)
+		if defaultCoinsMap[normalizedSymbol] {
+			filtered = append(filtered, pos)
+		}
+	}
+
+	if len(filtered) < len(positions) {
+		log.Printf("📊 Hyperliquid OI数据过滤: 原始%d个 → 过滤后%d个（仅保留default_coins中的币种）",
+			len(positions), len(filtered))
+	}
+
+	return filtered
 }
