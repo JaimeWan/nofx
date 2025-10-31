@@ -65,9 +65,4 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
   CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
 
-# 使用 ENTRYPOINT + CMD 方式，支持在运行时覆盖配置文件路径
-# 默认使用 /app/config.json，可以通过以下方式覆盖：
-# 1. docker run ... image /app/custom-config.json
-# 2. docker-compose.yml 中使用 command: ['./nofx', '/app/custom-config.json']
-ENTRYPOINT ["./nofx"]
-CMD ["/app/config.json"]
+CMD ["./nofx"]
