@@ -11,6 +11,7 @@ import (
 type TraderConfig struct {
 	ID      string `json:"id"`
 	Name    string `json:"name"`
+	Enabled bool   `json:"enabled"` // 是否启用该trader
 	AIModel string `json:"ai_model"` // "qwen" or "deepseek"
 
 	// 交易平台选择（二选一）
@@ -53,7 +54,7 @@ type LeverageConfig struct {
 type Config struct {
 	Traders                []TraderConfig `json:"traders"`
 	UseDefaultCoins        bool           `json:"use_default_coins"` // 是否使用默认主流币种列表
-	DefaultCoins           []string       `json:"default_coins"`     // 默认主流币种池
+	DefaultCoins           []string       `json:"default_coins"`     // 默认主流币种池（同时也是白名单，当不为空时自动启用白名单过滤）
 	CoinPoolAPIURL         string         `json:"coin_pool_api_url"`
 	OITopAPIURL            string         `json:"oi_top_api_url"`
 	APIServerPort          int            `json:"api_server_port"`
@@ -63,6 +64,17 @@ type Config struct {
 	Leverage               LeverageConfig `json:"leverage"`                  // 杠杆配置
 	MaxPositionCount       int            `json:"max_position_count"`        // 最多持仓币种数量
 	SingleTradeMarginRatio float64        `json:"single_trade_margin_ratio"` // 单笔开仓保证金比例（0-1）
+}
+
+// legacyCoinWhitelistConfig 用于向后兼容的旧配置结构
+type legacyCoinWhitelistConfig struct {
+	Enabled bool     `json:"enabled"`
+	Coins   []string `json:"coins"`
+}
+
+// legacyConfig 用于向后兼容的旧配置结构
+type legacyConfig struct {
+	CoinWhitelist legacyCoinWhitelistConfig `json:"coin_whitelist"`
 }
 
 // LoadConfig 从文件加载配置
@@ -75,6 +87,29 @@ func LoadConfig(filename string) (*Config, error) {
 	var config Config
 	if err := json.Unmarshal(data, &config); err != nil {
 		return nil, fmt.Errorf("解析配置文件失败: %w", err)
+	}
+
+	// 向后兼容：如果配置文件中存在旧的 coin_whitelist，并且启用了白名单，则合并到 DefaultCoins
+	var legacyCfg legacyConfig
+	if err := json.Unmarshal(data, &legacyCfg); err == nil {
+		if legacyCfg.CoinWhitelist.Enabled && len(legacyCfg.CoinWhitelist.Coins) > 0 {
+			// 如果 DefaultCoins 为空，直接使用 coin_whitelist.coins
+			if len(config.DefaultCoins) == 0 {
+				config.DefaultCoins = legacyCfg.CoinWhitelist.Coins
+			} else {
+				// 如果两者都存在，合并去重（保留 DefaultCoins 的顺序，添加 coin_whitelist 中不存在的币种）
+				coinMap := make(map[string]bool)
+				for _, coin := range config.DefaultCoins {
+					coinMap[coin] = true
+				}
+				for _, coin := range legacyCfg.CoinWhitelist.Coins {
+					if !coinMap[coin] {
+						config.DefaultCoins = append(config.DefaultCoins, coin)
+						coinMap[coin] = true
+					}
+				}
+			}
+		}
 	}
 
 	// 设置默认值：如果use_default_coins未设置（为false）且没有配置coin_pool_api_url，则默认使用默认币种列表
@@ -212,4 +247,31 @@ func (c *Config) Validate() error {
 // GetScanInterval 获取扫描间隔
 func (tc *TraderConfig) GetScanInterval() time.Duration {
 	return time.Duration(tc.ScanIntervalMinutes) * time.Minute
+}
+
+// IsCoinInWhitelist 检查币种是否在白名单中
+// 如果 DefaultCoins 不为空，则使用 DefaultCoins 作为白名单；否则允许所有币种
+func (c *Config) IsCoinInWhitelist(coin string) bool {
+	// 如果 DefaultCoins 为空，则允许所有币种
+	if len(c.DefaultCoins) == 0 {
+		return true
+	}
+
+	// 使用 DefaultCoins 作为白名单
+	for _, whitelistCoin := range c.DefaultCoins {
+		if whitelistCoin == coin {
+			return true
+		}
+	}
+	return false
+}
+
+// IsWhitelistEnabled 检查是否启用了白名单（DefaultCoins 不为空时自动启用）
+func (c *Config) IsWhitelistEnabled() bool {
+	return len(c.DefaultCoins) > 0
+}
+
+// GetWhitelistCoins 获取白名单币种列表（返回 DefaultCoins）
+func (c *Config) GetWhitelistCoins() []string {
+	return c.DefaultCoins
 }
