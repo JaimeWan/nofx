@@ -52,7 +52,7 @@ type weightedLevelSet struct {
 	weight float64
 }
 
-func calculateSupportResistanceSummary(klines3m, klines15m, klines1h, klines4h []Kline, currentPrice float64) *SupportResistanceSummary {
+func calculateSupportResistanceSummary(klines3m, klines15m, klines1h, klines4h, klines12h, klines1d []Kline, currentPrice float64) *SupportResistanceSummary {
 	tfInputs := []struct {
 		name   string
 		klines []Kline
@@ -61,6 +61,8 @@ func calculateSupportResistanceSummary(klines3m, klines15m, klines1h, klines4h [
 		{name: "15m", klines: klines15m},
 		{name: "1h", klines: klines1h},
 		{name: "4h", klines: klines4h},
+		{name: "12h", klines: klines12h},
+		{name: "1d", klines: klines1d},
 	}
 
 	summary := &SupportResistanceSummary{
@@ -87,25 +89,44 @@ func calculateSupportResistanceSummary(klines3m, klines15m, klines1h, klines4h [
 		}
 	}
 
-	base, ok := summary.Timeframes["3m"]
-	if !ok {
+	baseOrder := []string{"3m", "15m", "1h", "4h"}
+	var base *SupportResistanceTimeframe
+	var baseName string
+	for _, name := range baseOrder {
+		if tf, ok := summary.Timeframes[name]; ok {
+			base = tf
+			baseName = name
+			break
+		}
+	}
+
+	if base == nil {
 		return summary
 	}
 
 	supportSets := []weightedLevelSet{}
 	resistanceSets := []weightedLevelSet{}
 
-	if tf, ok := summary.Timeframes["15m"]; ok {
-		supportSets = append(supportSets, weightedLevelSet{levels: tf.Supports, weight: 1.0})
-		resistanceSets = append(resistanceSets, weightedLevelSet{levels: tf.Resistances, weight: 1.0})
+	weighting := []struct {
+		name   string
+		weight float64
+	}{
+		{name: "3m", weight: 0.8},
+		{name: "15m", weight: 1.0},
+		{name: "1h", weight: 1.2},
+		{name: "4h", weight: 1.4},
+		{name: "12h", weight: 1.6},
+		{name: "1d", weight: 1.8},
 	}
-	if tf, ok := summary.Timeframes["1h"]; ok {
-		supportSets = append(supportSets, weightedLevelSet{levels: tf.Supports, weight: 1.3})
-		resistanceSets = append(resistanceSets, weightedLevelSet{levels: tf.Resistances, weight: 1.3})
-	}
-	if tf, ok := summary.Timeframes["4h"]; ok {
-		supportSets = append(supportSets, weightedLevelSet{levels: tf.Supports, weight: 1.6})
-		resistanceSets = append(resistanceSets, weightedLevelSet{levels: tf.Resistances, weight: 1.6})
+
+	for _, config := range weighting {
+		if config.name == baseName {
+			continue
+		}
+		if tf, ok := summary.Timeframes[config.name]; ok {
+			supportSets = append(supportSets, weightedLevelSet{levels: tf.Supports, weight: config.weight})
+			resistanceSets = append(resistanceSets, weightedLevelSet{levels: tf.Resistances, weight: config.weight})
+		}
 	}
 
 	if len(supportSets) > 0 {

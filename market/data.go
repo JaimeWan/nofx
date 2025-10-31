@@ -136,6 +136,18 @@ func Get(symbol string, exchange string) (*Data, error) {
 		return nil, fmt.Errorf("获取4小时K线失败: %v", err)
 	}
 
+	// 获取12小时K线数据
+	klines12h, err := getKlines(symbol, "12h", 150)
+	if err != nil {
+		return nil, fmt.Errorf("获取12小时K线失败: %v", err)
+	}
+
+	// 获取1日K线数据
+	klines1d, err := getKlines(symbol, "1d", 150)
+	if err != nil {
+		return nil, fmt.Errorf("获取1日K线失败: %v", err)
+	}
+
 	// 计算当前指标 (基于3分钟最新数据)
 	currentPrice := klines3m[len(klines3m)-1].Close
 	currentEMA20 := calculateEMA(klines3m, 20)
@@ -190,7 +202,7 @@ func Get(symbol string, exchange string) (*Data, error) {
 	longerTermData := calculateLongerTermData(klines4h)
 
 	// 计算支撑阻力摘要
-	supportResistance := calculateSupportResistanceSummary(klines3m, klines15m, klines1h, klines4h, currentPrice)
+	supportResistance := calculateSupportResistanceSummary(klines3m, klines15m, klines1h, klines4h, klines12h, klines1d, currentPrice)
 
 	return &Data{
 		Symbol:            symbol,
@@ -759,7 +771,7 @@ func Format(data *Data) string {
 	if data.SupportResistance != nil && len(data.SupportResistance.Timeframes) > 0 {
 		sb.WriteString("支撑/阻力结构:\n\n")
 
-		ordered := []string{"3m", "15m", "1h", "4h"}
+		ordered := []string{"3m", "15m", "1h", "4h", "12h", "1d"}
 		for _, tf := range ordered {
 			if tfData, ok := data.SupportResistance.Timeframes[tf]; ok {
 				sb.WriteString(fmt.Sprintf("[%s] 支撑: %s\n", tf, formatSupportResistanceSlice(tfData.Supports, 3)))
@@ -768,7 +780,11 @@ func Format(data *Data) string {
 		}
 
 		if data.SupportResistance.Confluence != nil {
-			sb.WriteString("多周期共振 (3m 与长周期重合):\n")
+			baseLabel := "3m"
+			if _, ok := data.SupportResistance.Timeframes["3m"]; !ok {
+				baseLabel = "15m"
+			}
+			sb.WriteString(fmt.Sprintf("多周期共振 (%s 与长周期重合):\n", baseLabel))
 			sb.WriteString(fmt.Sprintf("共振支撑: %s\n", formatSupportResistanceSlice(data.SupportResistance.Confluence.Supports, 3)))
 			sb.WriteString(fmt.Sprintf("共振阻力: %s\n\n", formatSupportResistanceSlice(data.SupportResistance.Confluence.Resistances, 3)))
 		}

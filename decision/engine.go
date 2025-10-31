@@ -338,6 +338,7 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	sb.WriteString("**适应波动性**：根据市场条件调整仓位\n\n")
 	sb.WriteString("**尊重趋势**：不要与强趋势作对\n\n")
 	sb.WriteString("**支撑阻力优先**：多周期共振的支撑/阻力是最重要的价位，顺势靠近支撑才考虑做多，顶到阻力优先做空或减仓\n\n")
+	sb.WriteString("**级别匹配策略**：当信号来自4h/12h/1d等较高周期的支撑或阻力时，必须相应拉大止盈距离、延长持有时间，不得只顾短时波动；至少计划风险回报≥1:4，并给出持仓时间目标。\n\n")
 	sb.WriteString("## 常见误区避免：\n\n")
 	sb.WriteString("⚠️ **过度交易**：频繁交易导致费用侵蚀利润\n\n")
 	sb.WriteString("⚠️ **复仇式交易**：亏损后立即加码试图\"翻本\"\n\n")
@@ -368,7 +369,7 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	sb.WriteString("- 首先确认当前价格与多周期共振支撑/阻力之间的关系，必须顺势并尊重关键位\n")
 	sb.WriteString("- 自由运用序列数据，你可以做但不限于趋势分析、形态识别、支撑阻力、斐波那契、波动带计算\n")
 	sb.WriteString("- 多维度交叉验证（价格+量+持仓量+指标+形态），支撑位只寻找做多机会，阻力位只考虑做空或减仓\n")
-	sb.WriteString("- 计算潜在收益时先扣除往返手续费≈0.0864%，确认净收益仍满足风险回报≥1:3\n")
+	sb.WriteString("- 如果计划的止损/止盈基于4h及以上周期，请同步拉大持仓时长与目标收益，保持耐心，不可在短期波动中仓促退出\n")
 	sb.WriteString("- 用你认为最有效的方法发现高确定性机会\n")
 	sb.WriteString("- 综合信心度 ≥ 75 才开仓\n\n")
 	sb.WriteString("**避免低质量信号**：\n")
@@ -791,13 +792,13 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 
 		// 验证保证金不超过可用余额（关键约束）
 		requiredMargin := d.PositionSizeUSD / float64(d.Leverage)
-		if singleTradeMarginRatio > 0 {
-			maxAllowedMargin := accountEquity * singleTradeMarginRatio
-			if requiredMargin > maxAllowedMargin {
-				return fmt.Errorf("单笔保证金%.2f USDT超过限制%.2f USDT（账户净值%.2f的%.0f%%）",
-					requiredMargin, maxAllowedMargin, accountEquity, singleTradeMarginRatio*100)
-			}
-		}
+		// if singleTradeMarginRatio > 0 {
+		// 	maxAllowedMargin := accountEquity * singleTradeMarginRatio
+		// 	if requiredMargin > maxAllowedMargin {
+		// 		return fmt.Errorf("单笔保证金%.2f USDT超过限制%.2f USDT（账户净值%.2f的%.0f%%）",
+		// 			requiredMargin, maxAllowedMargin, accountEquity, singleTradeMarginRatio*100)
+		// 	}
+		// }
 		if requiredMargin > availableBalance {
 			return fmt.Errorf("保证金不足：所需保证金%.2f USDT（仓位%.2f / 杠杆%d）超过可用余额%.2f USDT",
 				requiredMargin, d.PositionSizeUSD, d.Leverage, availableBalance)
@@ -841,7 +842,7 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 			entryPrice = d.StopLoss - (d.StopLoss-d.TakeProfit)*0.2 // 假设在20%位置入场
 		}
 
-		var riskPercent, rewardPercent, riskRewardRatio float64
+		var riskPercent, rewardPercent float64
 		var netRewardPercent, effectiveRiskPercent float64
 		roundTripFeePercent := tradingFeeRate * 100 * 2 // 开仓+平仓总成本 (百分比)
 		if d.Action == "open_long" {
@@ -863,13 +864,6 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 			return fmt.Errorf("风险评估异常：止损距离过近或数据无效（风险%.4f%%）", effectiveRiskPercent)
 		}
 
-		riskRewardRatio = netRewardPercent / effectiveRiskPercent
-
-		// 硬约束：风险回报比必须≥3.0
-		if riskRewardRatio < 3.0 {
-			return fmt.Errorf("风险回报比过低(%.2f:1)，必须≥3.0:1 [净风险:%.2f%% 净收益:%.2f%% (含手续费)] [原始风险:%.2f%% 原始收益:%.2f%%] [止损:%.2f 止盈:%.2f]",
-				riskRewardRatio, effectiveRiskPercent, netRewardPercent, riskPercent, rewardPercent, d.StopLoss, d.TakeProfit)
-		}
 	}
 
 	return nil
