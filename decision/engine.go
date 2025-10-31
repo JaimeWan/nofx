@@ -10,6 +10,11 @@ import (
 	"time"
 )
 
+const (
+	// tradingFeeRate 表示单边开仓/平仓手续费 (0.0432%)
+	tradingFeeRate = 0.000432
+)
+
 // PositionInfo 持仓信息
 type PositionInfo struct {
 	Symbol           string  `json:"symbol"`
@@ -111,7 +116,7 @@ func GetFullDecision(ctx *Context, mcpClient *mcp.Client) (*FullDecision, error)
 	}
 
 	// 4. 解析AI响应
-	decision, err := parseFullDecisionResponse(aiResponse, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage, ctx.Account.AvailableBalance)
+	decision, err := parseFullDecisionResponse(aiResponse, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage, ctx.Account.AvailableBalance, ctx.SingleTradeMarginRatio)
 	if err != nil {
 		return nil, fmt.Errorf("解析AI响应失败: %w", err)
 	}
@@ -292,9 +297,27 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	sb.WriteString(fmt.Sprintf("2. **最多持仓**: %d个币种（质量>数量）\n", maxPositionCount))
 	sb.WriteString(fmt.Sprintf("3. **单币仓位大小**（position_size_usd，USD计价）: 山寨币 %.0f-%.0f USDT（%dx杠杆）| BTC/ETH %.0f-%.0f USDT（%dx杠杆）\n",
 		accountEquity*0.8, accountEquity*1.5, altcoinLeverage, accountEquity*5, accountEquity*10, btcEthLeverage))
+	// === 保证金与资金管理 ===
+	sb.WriteString("# 🛡️ 资金管理 (铁律)\n\n")
+	sb.WriteString("1. **永远以现金流安全为先**：亏损前不要扩仓\n\n")
+	sb.WriteString("2. **严格遵守单笔保证金比例**：\n")
+	sb.WriteString(fmt.Sprintf("   - 单笔开仓保证金比例：%.0f%%\n", singleTradeMarginRatio*100))
+	sb.WriteString("   - ⚠️ 绝对不允许超过可用余额！\n")
+	sb.WriteString(fmt.Sprintf("   - 📏 标准单笔保证金 = 账户净值 × %.0f%%\n", singleTradeMarginRatio*100))
+	sb.WriteString("   - ⚠️ 在保证金充足时应优先以此为目标\n\n")
+	sb.WriteString("3. **总使用率限制**：\n")
+	sb.WriteString(fmt.Sprintf("   - 总使用率上限：≤ %.0f%%\n", 90.0))
+	sb.WriteString("   - 🚨 超过此限制将触发警报\n\n")
 	sb.WriteString("4. **保证金管理**（⚠️ 严格约束！）：\n")
 	sb.WriteString("   - 总使用率上限：≤ 90%\n")
-	sb.WriteString(fmt.Sprintf("   - ⚠️ **每笔新开仓**：单笔保证金不应超过账户净值的%.0f%%\n", singleTradeMarginRatio*100))
+	sb.WriteString(fmt.Sprintf("   - ⚠️ **每笔新开仓**：单笔保证金必须≤账户净值的%.0f%%（硬性上限）\n", singleTradeMarginRatio*100))
+	standardMargin := accountEquity * singleTradeMarginRatio
+	if standardMargin > 0 {
+		if standardMargin > accountEquity {
+			standardMargin = accountEquity
+		}
+		sb.WriteString(fmt.Sprintf("   - 📏 **标准单笔保证金**：账户净值%.2f × %.0f%% = %.2f USDT；在保证金充足时应优先以此为目标\n", accountEquity, singleTradeMarginRatio*100, standardMargin))
+	}
 	sb.WriteString("   - 🚨 **绝对硬约束**：单笔保证金绝对不能超过可用余额（AvailableBalance）！\n")
 	sb.WriteString("   - 📊 **计算公式**：单笔保证金 = position_size_usd / leverage\n")
 	sb.WriteString("   - 🚨 **最大仓位限制**：position_size_usd ≤ 可用余额 × leverage\n")
@@ -304,6 +327,7 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	sb.WriteString("   - 💡 **示例**：如果可用余额是837.14 USDT，杠杆5倍，则最大仓位 = 837.14 × 5 = 4185.70 USDT\n")
 	sb.WriteString("   - 🚨 **验证失败将被拒绝**：如果保证金超过可用余额，整个决策将被拒绝，必须重新计算\n\n")
 	sb.WriteString("5. **禁止突破追价**：在阻力位不许追多，在支撑位不许追空；若出现突破/跌破，必须等待回踩确认后再评估，严禁直接追单。\n\n")
+	sb.WriteString("6. **交易手续费**：开仓和平仓各收0.0432%，往返约0.0864%；所有风险/收益计算必须先扣除这部分成本。\n\n")
 
 	// === 交易哲学 & 最佳实践 ===
 	sb.WriteString("# 🎯 交易哲学 & 最佳实践\n\n")
@@ -344,6 +368,7 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	sb.WriteString("- 首先确认当前价格与多周期共振支撑/阻力之间的关系，必须顺势并尊重关键位\n")
 	sb.WriteString("- 自由运用序列数据，你可以做但不限于趋势分析、形态识别、支撑阻力、斐波那契、波动带计算\n")
 	sb.WriteString("- 多维度交叉验证（价格+量+持仓量+指标+形态），支撑位只寻找做多机会，阻力位只考虑做空或减仓\n")
+	sb.WriteString("- 计算潜在收益时先扣除往返手续费≈0.0864%，确认净收益仍满足风险回报≥1:3\n")
 	sb.WriteString("- 用你认为最有效的方法发现高确定性机会\n")
 	sb.WriteString("- 综合信心度 ≥ 75 才开仓\n\n")
 	sb.WriteString("**避免低质量信号**：\n")
@@ -471,9 +496,9 @@ func buildUserPrompt(ctx *Context) string {
 	if actualAvailableBalance < recommendedSingleTradeMargin {
 		// 可用余额不足，使用实际可用余额作为上限
 		if actualAvailableBalance > 0 {
-			sb.WriteString(fmt.Sprintf("⚠️ **资金不足警告**: 当前可用余额%.2f USDT < 建议保证金%.0f USDT！\n",
-				actualAvailableBalance, recommendedSingleTradeMargin))
-			sb.WriteString(fmt.Sprintf("   单笔新开仓保证金不能超过可用余额%.2f USDT，否则将无法开仓！\n", actualAvailableBalance))
+			sb.WriteString(fmt.Sprintf("⚠️ **资金不足警告**: 当前可用余额%.2f USDT < 标准单笔保证金%.0f USDT（账户净值%.2f × %.0f%%）！\n",
+				actualAvailableBalance, recommendedSingleTradeMargin, ctx.Account.TotalEquity, ctx.SingleTradeMarginRatio*100))
+			sb.WriteString(fmt.Sprintf("   单笔新开仓仍需以标准比例为目标，但受限于可用余额，当前上限为%.2f USDT。\n", actualAvailableBalance))
 			sb.WriteString("   建议：优先平仓释放保证金，或等待账户余额增加后再开仓\n\n")
 		} else {
 			sb.WriteString(fmt.Sprintf("🚨 **资金严重不足**: 当前可用余额为0或负数（%.2f USDT）！\n", actualAvailableBalance))
@@ -482,22 +507,24 @@ func buildUserPrompt(ctx *Context) string {
 	} else {
 		// 可用余额充足，按正常逻辑显示
 		if ctx.Account.MarginUsedPct < 70 {
-			sb.WriteString(fmt.Sprintf("💡 **保证金建议**: 当前可用%.1f%% | 可用余额%.2f USDT | 单笔新开仓建议保证金≤%.0f USDT（账户净值的%.0f%%）\n\n",
+			sb.WriteString(fmt.Sprintf("💡 **保证金建议**: 当前可用%.1f%% | 可用余额%.2f USDT | 单笔标准保证金=%.0f USDT（账户净值的%.0f%%），请以此为目标\n\n",
 				availableMarginPct, actualAvailableBalance, recommendedSingleTradeMargin, ctx.SingleTradeMarginRatio*100))
 		} else if ctx.Account.MarginUsedPct < 85 {
-			sb.WriteString(fmt.Sprintf("⚠️ **保证金警告**: 当前已使用%.1f%%，接近上限！可用余额%.2f USDT | 单笔新开仓建议保证金≤%.0f USDT（账户净值的%.0f%%）\n\n",
+			sb.WriteString(fmt.Sprintf("⚠️ **保证金警告**: 当前已使用%.1f%%，接近上限！可用余额%.2f USDT | 单笔标准保证金=%.0f USDT（账户净值的%.0f%%），请谨慎是否开新仓\n\n",
 				ctx.Account.MarginUsedPct, actualAvailableBalance, recommendedSingleTradeMargin, ctx.SingleTradeMarginRatio*100))
 		} else {
-			sb.WriteString(fmt.Sprintf("🚨 **保证金警报**: 当前已使用%.1f%%，接近90%%上限！可用余额%.2f USDT | 强烈建议暂停新开仓，优先考虑平仓或等待\n\n",
-				ctx.Account.MarginUsedPct, actualAvailableBalance))
+			sb.WriteString(fmt.Sprintf("🚨 **保证金警报**: 当前已使用%.1f%%，接近90%%上限！可用余额%.2f USDT | 单笔标准保证金=%.0f USDT（%.0f%%），强烈建议暂停新开仓\n\n",
+				ctx.Account.MarginUsedPct, actualAvailableBalance, recommendedSingleTradeMargin, ctx.SingleTradeMarginRatio*100))
 		}
 	}
 
 	// 额外提醒：单笔保证金不能超过可用余额（关键约束）
 	if actualAvailableBalance > 0 {
 		sb.WriteString("🚨 **保证金硬约束（必须严格遵守）**:\n")
-		sb.WriteString(fmt.Sprintf("   单笔保证金 = position_size_usd / leverage ≤ %.2f USDT（可用余额）\n", actualAvailableBalance))
-		sb.WriteString(fmt.Sprintf("   最大仓位大小 = %.2f × leverage（可用余额 × 杠杆）\n", actualAvailableBalance))
+		sb.WriteString(fmt.Sprintf("   单笔保证金 = position_size_usd / leverage ≤ min(%.2f USDT（标准额度）, %.2f USDT（可用余额）)\n",
+			recommendedSingleTradeMargin, actualAvailableBalance))
+		sb.WriteString(fmt.Sprintf("   最大仓位大小 ≤ min(%.2f × leverage, %.2f × leverage)\n",
+			recommendedSingleTradeMargin, actualAvailableBalance))
 
 		// 显示不同杠杆下的最大仓位
 		if actualAvailableBalance < recommendedSingleTradeMargin {
@@ -526,6 +553,8 @@ func buildUserPrompt(ctx *Context) string {
 		sb.WriteString(confluenceSummary)
 		sb.WriteString("\n")
 	}
+
+	sb.WriteString("⚠️ 手续费提醒：开仓和平仓各收0.0432%，往返约0.0864%；净收益需扣除该成本后再评估。\n\n")
 
 	// 持仓（完整市场数据）
 	if len(ctx.Positions) > 0 {
@@ -614,7 +643,7 @@ func buildUserPrompt(ctx *Context) string {
 }
 
 // parseFullDecisionResponse 解析AI的完整决策响应
-func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthLeverage, altcoinLeverage int, availableBalance float64) (*FullDecision, error) {
+func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthLeverage, altcoinLeverage int, availableBalance float64, singleTradeMarginRatio float64) (*FullDecision, error) {
 	// 1. 提取思维链
 	cotTrace := extractCoTTrace(aiResponse)
 
@@ -628,7 +657,7 @@ func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthL
 	}
 
 	// 3. 验证决策
-	if err := validateDecisions(decisions, accountEquity, btcEthLeverage, altcoinLeverage, availableBalance); err != nil {
+	if err := validateDecisions(decisions, accountEquity, btcEthLeverage, altcoinLeverage, availableBalance, singleTradeMarginRatio); err != nil {
 		return &FullDecision{
 			CoTTrace:  cotTrace,
 			Decisions: decisions,
@@ -696,9 +725,9 @@ func fixMissingQuotes(jsonStr string) string {
 }
 
 // validateDecisions 验证所有决策（需要账户信息和杠杆配置）
-func validateDecisions(decisions []Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int, availableBalance float64) error {
+func validateDecisions(decisions []Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int, availableBalance float64, singleTradeMarginRatio float64) error {
 	for i, decision := range decisions {
-		if err := validateDecision(&decision, accountEquity, btcEthLeverage, altcoinLeverage, availableBalance); err != nil {
+		if err := validateDecision(&decision, accountEquity, btcEthLeverage, altcoinLeverage, availableBalance, singleTradeMarginRatio); err != nil {
 			return fmt.Errorf("决策 #%d 验证失败: %w", i+1, err)
 		}
 	}
@@ -728,7 +757,7 @@ func findMatchingBracket(s string, start int) int {
 }
 
 // validateDecision 验证单个决策的有效性
-func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int, availableBalance float64) error {
+func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int, availableBalance float64, singleTradeMarginRatio float64) error {
 	// 验证action
 	validActions := map[string]bool{
 		"open_long":   true,
@@ -762,6 +791,13 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 
 		// 验证保证金不超过可用余额（关键约束）
 		requiredMargin := d.PositionSizeUSD / float64(d.Leverage)
+		if singleTradeMarginRatio > 0 {
+			maxAllowedMargin := accountEquity * singleTradeMarginRatio
+			if requiredMargin > maxAllowedMargin {
+				return fmt.Errorf("单笔保证金%.2f USDT超过限制%.2f USDT（账户净值%.2f的%.0f%%）",
+					requiredMargin, maxAllowedMargin, accountEquity, singleTradeMarginRatio*100)
+			}
+		}
 		if requiredMargin > availableBalance {
 			return fmt.Errorf("保证金不足：所需保证金%.2f USDT（仓位%.2f / 杠杆%d）超过可用余额%.2f USDT",
 				requiredMargin, d.PositionSizeUSD, d.Leverage, availableBalance)
@@ -806,24 +842,33 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 		}
 
 		var riskPercent, rewardPercent, riskRewardRatio float64
+		var netRewardPercent, effectiveRiskPercent float64
+		roundTripFeePercent := tradingFeeRate * 100 * 2 // 开仓+平仓总成本 (百分比)
 		if d.Action == "open_long" {
 			riskPercent = (entryPrice - d.StopLoss) / entryPrice * 100
 			rewardPercent = (d.TakeProfit - entryPrice) / entryPrice * 100
-			if riskPercent > 0 {
-				riskRewardRatio = rewardPercent / riskPercent
-			}
 		} else {
 			riskPercent = (d.StopLoss - entryPrice) / entryPrice * 100
 			rewardPercent = (entryPrice - d.TakeProfit) / entryPrice * 100
-			if riskPercent > 0 {
-				riskRewardRatio = rewardPercent / riskPercent
-			}
 		}
+
+		effectiveRiskPercent = riskPercent + roundTripFeePercent
+		netRewardPercent = rewardPercent - roundTripFeePercent
+
+		if netRewardPercent <= 0 {
+			return fmt.Errorf("考虑手续费(%.4f%%)后，潜在收益%.2f%%不足以覆盖成本", roundTripFeePercent, rewardPercent)
+		}
+
+		if effectiveRiskPercent <= 0 {
+			return fmt.Errorf("风险评估异常：止损距离过近或数据无效（风险%.4f%%）", effectiveRiskPercent)
+		}
+
+		riskRewardRatio = netRewardPercent / effectiveRiskPercent
 
 		// 硬约束：风险回报比必须≥3.0
 		if riskRewardRatio < 3.0 {
-			return fmt.Errorf("风险回报比过低(%.2f:1)，必须≥3.0:1 [风险:%.2f%% 收益:%.2f%%] [止损:%.2f 止盈:%.2f]",
-				riskRewardRatio, riskPercent, rewardPercent, d.StopLoss, d.TakeProfit)
+			return fmt.Errorf("风险回报比过低(%.2f:1)，必须≥3.0:1 [净风险:%.2f%% 净收益:%.2f%% (含手续费)] [原始风险:%.2f%% 原始收益:%.2f%%] [止损:%.2f 止盈:%.2f]",
+				riskRewardRatio, effectiveRiskPercent, netRewardPercent, riskPercent, rewardPercent, d.StopLoss, d.TakeProfit)
 		}
 	}
 
