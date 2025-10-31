@@ -303,6 +303,7 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	sb.WriteString("   - ⚠️ **预留缓冲**：始终保持至少10-20%的可用保证金，以应对波动和追加保证金需求\n")
 	sb.WriteString("   - 💡 **示例**：如果可用余额是837.14 USDT，杠杆5倍，则最大仓位 = 837.14 × 5 = 4185.70 USDT\n")
 	sb.WriteString("   - 🚨 **验证失败将被拒绝**：如果保证金超过可用余额，整个决策将被拒绝，必须重新计算\n\n")
+	sb.WriteString("5. **禁止突破追价**：在阻力位不许追多，在支撑位不许追空；若出现突破/跌破，必须等待回踩确认后再评估，严禁直接追单。\n\n")
 
 	// === 交易哲学 & 最佳实践 ===
 	sb.WriteString("# 🎯 交易哲学 & 最佳实践\n\n")
@@ -312,6 +313,7 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	sb.WriteString("**质量优于数量**：少量高信念交易胜过大量低信念交易\n\n")
 	sb.WriteString("**适应波动性**：根据市场条件调整仓位\n\n")
 	sb.WriteString("**尊重趋势**：不要与强趋势作对\n\n")
+	sb.WriteString("**支撑阻力优先**：多周期共振的支撑/阻力是最重要的价位，顺势靠近支撑才考虑做多，顶到阻力优先做空或减仓\n\n")
 	sb.WriteString("## 常见误区避免：\n\n")
 	sb.WriteString("⚠️ **过度交易**：频繁交易导致费用侵蚀利润\n\n")
 	sb.WriteString("⚠️ **复仇式交易**：亏损后立即加码试图\"翻本\"\n\n")
@@ -339,8 +341,9 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	sb.WriteString("- 💰 **资金序列**：成交量序列、持仓量(OI)序列、资金费率\n")
 	sb.WriteString("- 🎯 **筛选标记**：AI500评分 / OI_Top排名（如果有标注）\n\n")
 	sb.WriteString("**分析方法**（完全由你自主决定）：\n")
-	sb.WriteString("- 自由运用序列数据，你可以做但不限于趋势分析、形态识别、支撑阻力、技术阻力位、斐波那契、波动带计算\n")
-	sb.WriteString("- 多维度交叉验证（价格+量+OI+指标+序列形态）\n")
+	sb.WriteString("- 首先确认当前价格与多周期共振支撑/阻力之间的关系，必须顺势并尊重关键位\n")
+	sb.WriteString("- 自由运用序列数据，你可以做但不限于趋势分析、形态识别、支撑阻力、斐波那契、波动带计算\n")
+	sb.WriteString("- 多维度交叉验证（价格+量+持仓量+指标+形态），支撑位只寻找做多机会，阻力位只考虑做空或减仓\n")
 	sb.WriteString("- 用你认为最有效的方法发现高确定性机会\n")
 	sb.WriteString("- 综合信心度 ≥ 75 才开仓\n\n")
 	sb.WriteString("**避免低质量信号**：\n")
@@ -407,6 +410,24 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	sb.WriteString("- 与你的退出方案保持一致（不要提前取消止损或目标）\n")
 
 	return sb.String()
+}
+
+func summarizeConfluenceLevels(levels []market.SupportResistanceLevel, limit int) string {
+	if len(levels) == 0 {
+		return "-"
+	}
+
+	if len(levels) > limit {
+		levels = levels[:limit]
+	}
+
+	parts := make([]string, len(levels))
+	for i, level := range levels {
+		parts[i] = fmt.Sprintf("%.2f(强度%d, 得分%.2f, 距离%.2f%%)",
+			level.Price, level.Strength, level.Score, level.Distance)
+	}
+
+	return strings.Join(parts, " | ")
 }
 
 // buildUserPrompt 构建 User Prompt（动态数据）
@@ -496,6 +517,14 @@ func buildUserPrompt(ctx *Context) string {
 		}
 
 		sb.WriteString("   🚨 超过此限制的决策将被系统拒绝！请务必在计算仓位时检查此约束！\n\n")
+	}
+
+	// 多周期支撑阻力摘要
+	confluenceSummary := buildSupportResistanceDigest(ctx)
+	if confluenceSummary != "" {
+		sb.WriteString("## 多周期关键支撑/阻力\n\n")
+		sb.WriteString(confluenceSummary)
+		sb.WriteString("\n")
 	}
 
 	// 持仓（完整市场数据）
@@ -799,4 +828,63 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 	}
 
 	return nil
+}
+
+func buildSupportResistanceDigest(ctx *Context) string {
+	seen := make(map[string]bool)
+	symbols := make([]string, 0)
+
+	addSymbol := func(symbol string) {
+		symbol = strings.ToUpper(symbol)
+		if !seen[symbol] {
+			seen[symbol] = true
+			symbols = append(symbols, symbol)
+		}
+	}
+
+	for _, pos := range ctx.Positions {
+		addSymbol(pos.Symbol)
+	}
+
+	for _, coin := range ctx.CandidateCoins {
+		addSymbol(coin.Symbol)
+	}
+
+	ordered := make([]string, 0, len(symbols))
+	if seen["BTCUSDT"] {
+		ordered = append(ordered, "BTCUSDT")
+	}
+	for _, symbol := range symbols {
+		if symbol == "BTCUSDT" {
+			continue
+		}
+		ordered = append(ordered, symbol)
+	}
+
+	var sb strings.Builder
+	for _, symbol := range ordered {
+		data, exists := ctx.MarketDataMap[symbol]
+		if !exists || data == nil || data.SupportResistance == nil || data.SupportResistance.Confluence == nil {
+			continue
+		}
+
+		con := data.SupportResistance.Confluence
+		if len(con.Supports) == 0 && len(con.Resistances) == 0 {
+			continue
+		}
+
+		sb.WriteString(fmt.Sprintf("- %s: ", symbol))
+		if len(con.Supports) > 0 {
+			sb.WriteString(fmt.Sprintf("支撑 %s", summarizeConfluenceLevels(con.Supports, 2)))
+		}
+		if len(con.Resistances) > 0 {
+			if len(con.Supports) > 0 {
+				sb.WriteString("；")
+			}
+			sb.WriteString(fmt.Sprintf("阻力 %s", summarizeConfluenceLevels(con.Resistances, 2)))
+		}
+		sb.WriteString("\n")
+	}
+
+	return sb.String()
 }

@@ -56,6 +56,7 @@ type Data struct {
 	IntradaySeries    *IntradayData
 	LongerTermContext *LongerTermData
 	OITopData         *OITopData // OI Top数据
+	SupportResistance *SupportResistanceSummary
 }
 
 // OITopData OI Top数据结构
@@ -111,14 +112,26 @@ func Get(symbol string, exchange string) (*Data, error) {
 	// 标准化symbol
 	symbol = Normalize(symbol)
 
-	// 获取3分钟K线数据 (最近10个)
-	klines3m, err := getKlines(symbol, "3m", 40) // 多获取一些用于计算
+	// 获取3分钟K线数据
+	klines3m, err := getKlines(symbol, "3m", 150)
 	if err != nil {
 		return nil, fmt.Errorf("获取3分钟K线失败: %v", err)
 	}
 
-	// 获取4小时K线数据 (最近10个)
-	klines4h, err := getKlines(symbol, "4h", 60) // 多获取用于计算指标
+	// 获取15分钟K线数据
+	klines15m, err := getKlines(symbol, "15m", 150)
+	if err != nil {
+		return nil, fmt.Errorf("获取15分钟K线失败: %v", err)
+	}
+
+	// 获取1小时K线数据
+	klines1h, err := getKlines(symbol, "1h", 150)
+	if err != nil {
+		return nil, fmt.Errorf("获取1小时K线失败: %v", err)
+	}
+
+	// 获取4小时K线数据
+	klines4h, err := getKlines(symbol, "4h", 150)
 	if err != nil {
 		return nil, fmt.Errorf("获取4小时K线失败: %v", err)
 	}
@@ -176,6 +189,9 @@ func Get(symbol string, exchange string) (*Data, error) {
 	// 计算长期数据
 	longerTermData := calculateLongerTermData(klines4h)
 
+	// 计算支撑阻力摘要
+	supportResistance := calculateSupportResistanceSummary(klines3m, klines15m, klines1h, klines4h, currentPrice)
+
 	return &Data{
 		Symbol:            symbol,
 		CurrentPrice:      currentPrice,
@@ -188,6 +204,7 @@ func Get(symbol string, exchange string) (*Data, error) {
 		FundingRate:       fundingRate,
 		IntradaySeries:    intradayData,
 		LongerTermContext: longerTermData,
+		SupportResistance: supportResistance,
 	}, nil
 }
 
@@ -519,48 +536,48 @@ func getHyperliquidOpenInterestData(symbol string) (*OIData, error) {
 
 	resp, err := client.Post("https://api.hyperliquid.xyz/info", "application/json", strings.NewReader(string(jsonData)))
 	if err != nil {
-		return nil, fmt.Errorf("请求Hyperliquid OI API失败: %w", err)
+		return nil, fmt.Errorf("请求hyperliquid OI API失败: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("读取Hyperliquid OI响应失败: %w", err)
+		return nil, fmt.Errorf("读取hyperliquid oi响应失败: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("Hyperliquid OI API返回错误 (status %d): %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("hyperliquid oi api返回错误 (status %d): %s", resp.StatusCode, string(body))
 	}
 
 	// 解析API响应
 	var response []interface{}
 	if err := json.Unmarshal(body, &response); err != nil {
-		return nil, fmt.Errorf("Hyperliquid OI JSON解析失败: %w", err)
+		return nil, fmt.Errorf("hyperliquid oi json解析失败: %w", err)
 	}
 
 	if len(response) < 2 {
-		return nil, fmt.Errorf("Hyperliquid OI响应格式错误")
+		return nil, fmt.Errorf("hyperliquid oi响应格式错误")
 	}
 
 	// 解析universe数据
 	universeData, ok := response[0].(map[string]interface{})
 	if !ok {
-		return nil, fmt.Errorf("Hyperliquid OI universe数据格式错误")
+		return nil, fmt.Errorf("hyperliquid oi universe数据格式错误")
 	}
 
 	universe, ok := universeData["universe"].([]interface{})
 	if !ok {
-		return nil, fmt.Errorf("Hyperliquid OI universe数组格式错误")
+		return nil, fmt.Errorf("hyperliquid oi universe数组格式错误")
 	}
 
 	// 解析assetCtxs数据
 	assetCtxs, ok := response[1].([]interface{})
 	if !ok {
-		return nil, fmt.Errorf("Hyperliquid OI assetCtxs数据格式错误")
+		return nil, fmt.Errorf("hyperliquid oi assetCtxs数据格式错误")
 	}
 
 	if len(universe) != len(assetCtxs) {
-		return nil, fmt.Errorf("Hyperliquid OI数据长度不匹配")
+		return nil, fmt.Errorf("hyperliquid oi数据长度不匹配")
 	}
 
 	// 更新缓存
@@ -652,91 +669,111 @@ func getFundingRate(symbol string) (float64, error) {
 func Format(data *Data) string {
 	var sb strings.Builder
 
-	sb.WriteString(fmt.Sprintf("current_price = %.2f, current_ema20 = %.3f, current_macd = %.3f, current_rsi (7 period) = %.3f\n\n",
+	sb.WriteString(fmt.Sprintf("当前价格 = %.2f, EMA20 = %.3f, MACD = %.3f, RSI(7) = %.3f\n\n",
 		data.CurrentPrice, data.CurrentEMA20, data.CurrentMACD, data.CurrentRSI7))
 
-	sb.WriteString(fmt.Sprintf("In addition, here is the latest %s open interest and funding rate for perps:\n\n",
+	sb.WriteString(fmt.Sprintf("以下为 %s 的持仓量与资金费率信息:\n\n",
 		data.Symbol))
 
 	if data.OpenInterest != nil {
 		// 显示原始OI数量和USD价值
 		oiValueUSD := data.OpenInterest.Latest * data.CurrentPrice
-		sb.WriteString(fmt.Sprintf("Open Interest: Latest: %.2f (数量) | Value: %.2f USD (数量 × 价格) | Average: %.2f\n\n",
+		sb.WriteString(fmt.Sprintf("合约持仓量: 最新 %.2f (张) | 价值 %.2f USD | 平均 %.2f\n\n",
 			data.OpenInterest.Latest, oiValueUSD, data.OpenInterest.Average))
 	}
 
-	sb.WriteString(fmt.Sprintf("Funding Rate: %.2e\n\n", data.FundingRate))
+	sb.WriteString(fmt.Sprintf("资金费率: %.2e\n\n", data.FundingRate))
 
 	// 添加OI Top数据
 	if data.OITopData != nil {
-		sb.WriteString("OI Top Data (持仓量分析):\n\n")
+		sb.WriteString("持仓量排名数据:\n\n")
 
 		if data.OITopData.Rank > 0 {
-			sb.WriteString(fmt.Sprintf("Rank: #%d\n", data.OITopData.Rank))
+			sb.WriteString(fmt.Sprintf("排名: #%d\n", data.OITopData.Rank))
 		}
 
 		if data.OITopData.OIDeltaValue > 0 {
-			sb.WriteString(fmt.Sprintf("OI Value: %.2f\n", data.OITopData.OIDeltaValue))
+			sb.WriteString(fmt.Sprintf("持仓量变化值: %.2f\n", data.OITopData.OIDeltaValue))
 		}
 
 		if data.OITopData.OIDeltaPercent != 0 {
-			sb.WriteString(fmt.Sprintf("OI Change: %.2f%%\n", data.OITopData.OIDeltaPercent))
+			sb.WriteString(fmt.Sprintf("持仓量变化幅度: %.2f%%\n", data.OITopData.OIDeltaPercent))
 		}
 
 		if data.OITopData.PriceDeltaPercent != 0 {
-			sb.WriteString(fmt.Sprintf("Price Change: %.2f%%\n", data.OITopData.PriceDeltaPercent))
+			sb.WriteString(fmt.Sprintf("价格变化幅度: %.2f%%\n", data.OITopData.PriceDeltaPercent))
 		}
 
 		if data.OITopData.NetLong > 0 || data.OITopData.NetShort > 0 {
-			sb.WriteString(fmt.Sprintf("Net Long: %.2f | Net Short: %.2f\n", data.OITopData.NetLong, data.OITopData.NetShort))
+			sb.WriteString(fmt.Sprintf("净多头: %.2f | 净空头: %.2f\n", data.OITopData.NetLong, data.OITopData.NetShort))
 		}
 
 		sb.WriteString("\n")
 	}
 
 	if data.IntradaySeries != nil {
-		sb.WriteString("Intraday series (3‑minute intervals, oldest → latest):\n\n")
+		sb.WriteString("3分钟级别序列（从旧到新）:\n\n")
 
 		if len(data.IntradaySeries.MidPrices) > 0 {
-			sb.WriteString(fmt.Sprintf("Mid prices: %s\n\n", formatFloatSlice(data.IntradaySeries.MidPrices)))
+			sb.WriteString(fmt.Sprintf("收盘价序列: %s\n\n", formatFloatSlice(data.IntradaySeries.MidPrices)))
 		}
 
 		if len(data.IntradaySeries.EMA20Values) > 0 {
-			sb.WriteString(fmt.Sprintf("EMA indicators (20‑period): %s\n\n", formatFloatSlice(data.IntradaySeries.EMA20Values)))
+			sb.WriteString(fmt.Sprintf("EMA(20周期): %s\n\n", formatFloatSlice(data.IntradaySeries.EMA20Values)))
 		}
 
 		if len(data.IntradaySeries.MACDValues) > 0 {
-			sb.WriteString(fmt.Sprintf("MACD indicators: %s\n\n", formatFloatSlice(data.IntradaySeries.MACDValues)))
+			sb.WriteString(fmt.Sprintf("MACD序列: %s\n\n", formatFloatSlice(data.IntradaySeries.MACDValues)))
 		}
 
 		if len(data.IntradaySeries.RSI7Values) > 0 {
-			sb.WriteString(fmt.Sprintf("RSI indicators (7‑Period): %s\n\n", formatFloatSlice(data.IntradaySeries.RSI7Values)))
+			sb.WriteString(fmt.Sprintf("RSI(7周期): %s\n\n", formatFloatSlice(data.IntradaySeries.RSI7Values)))
 		}
 
 		if len(data.IntradaySeries.RSI14Values) > 0 {
-			sb.WriteString(fmt.Sprintf("RSI indicators (14‑Period): %s\n\n", formatFloatSlice(data.IntradaySeries.RSI14Values)))
+			sb.WriteString(fmt.Sprintf("RSI(14周期): %s\n\n", formatFloatSlice(data.IntradaySeries.RSI14Values)))
 		}
 	}
 
 	if data.LongerTermContext != nil {
-		sb.WriteString("Longer‑term context (4‑hour timeframe):\n\n")
+		sb.WriteString("4小时级别背景数据:\n\n")
 
-		sb.WriteString(fmt.Sprintf("20‑Period EMA: %.3f vs. 50‑Period EMA: %.3f\n\n",
+		sb.WriteString(fmt.Sprintf("EMA: 20周期 %.3f vs. 50周期 %.3f\n\n",
 			data.LongerTermContext.EMA20, data.LongerTermContext.EMA50))
 
-		sb.WriteString(fmt.Sprintf("3‑Period ATR: %.3f vs. 14‑Period ATR: %.3f\n\n",
+		sb.WriteString(fmt.Sprintf("ATR: 3周期 %.3f vs. 14周期 %.3f\n\n",
 			data.LongerTermContext.ATR3, data.LongerTermContext.ATR14))
 
-		sb.WriteString(fmt.Sprintf("Current Volume: %.3f vs. Average Volume: %.3f\n\n",
+		sb.WriteString(fmt.Sprintf("成交量: 当前 %.3f vs. 均值 %.3f\n\n",
 			data.LongerTermContext.CurrentVolume, data.LongerTermContext.AverageVolume))
 
 		if len(data.LongerTermContext.MACDValues) > 0 {
-			sb.WriteString(fmt.Sprintf("MACD indicators: %s\n\n", formatFloatSlice(data.LongerTermContext.MACDValues)))
+			sb.WriteString(fmt.Sprintf("MACD序列: %s\n\n", formatFloatSlice(data.LongerTermContext.MACDValues)))
 		}
 
 		if len(data.LongerTermContext.RSI14Values) > 0 {
-			sb.WriteString(fmt.Sprintf("RSI indicators (14‑Period): %s\n\n", formatFloatSlice(data.LongerTermContext.RSI14Values)))
+			sb.WriteString(fmt.Sprintf("RSI(14周期): %s\n\n", formatFloatSlice(data.LongerTermContext.RSI14Values)))
 		}
+	}
+
+	if data.SupportResistance != nil && len(data.SupportResistance.Timeframes) > 0 {
+		sb.WriteString("支撑/阻力结构:\n\n")
+
+		ordered := []string{"3m", "15m", "1h", "4h"}
+		for _, tf := range ordered {
+			if tfData, ok := data.SupportResistance.Timeframes[tf]; ok {
+				sb.WriteString(fmt.Sprintf("[%s] 支撑: %s\n", tf, formatSupportResistanceSlice(tfData.Supports, 3)))
+				sb.WriteString(fmt.Sprintf("[%s] 阻力: %s\n\n", tf, formatSupportResistanceSlice(tfData.Resistances, 3)))
+			}
+		}
+
+		if data.SupportResistance.Confluence != nil {
+			sb.WriteString("多周期共振 (3m 与长周期重合):\n")
+			sb.WriteString(fmt.Sprintf("共振支撑: %s\n", formatSupportResistanceSlice(data.SupportResistance.Confluence.Supports, 3)))
+			sb.WriteString(fmt.Sprintf("共振阻力: %s\n\n", formatSupportResistanceSlice(data.SupportResistance.Confluence.Resistances, 3)))
+		}
+
+		sb.WriteString("⚠️ 交易原则: 禁止在阻力位追多，也禁止在支撑位追空。\n\n")
 	}
 
 	return sb.String()
@@ -749,6 +786,23 @@ func formatFloatSlice(values []float64) string {
 		strValues[i] = fmt.Sprintf("%.3f", v)
 	}
 	return "[" + strings.Join(strValues, ", ") + "]"
+}
+
+func formatSupportResistanceSlice(levels []SupportResistanceLevel, limit int) string {
+	if len(levels) == 0 {
+		return "-"
+	}
+
+	if len(levels) > limit {
+		levels = levels[:limit]
+	}
+
+	parts := make([]string, len(levels))
+	for i, level := range levels {
+		parts[i] = fmt.Sprintf("%.2f (强度%d, 得分%.2f, 距离%.2f%%)", level.Price, level.Strength, level.Score, level.Distance)
+	}
+
+	return strings.Join(parts, " | ")
 }
 
 // Normalize 标准化symbol,确保是USDT交易对
