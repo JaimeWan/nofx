@@ -2,7 +2,6 @@ package trader
 
 import (
 	"context"
-	"crypto/ecdsa"
 	"fmt"
 	"log"
 	"strconv"
@@ -20,7 +19,7 @@ type HyperliquidTrader struct {
 }
 
 // NewHyperliquidTrader 创建Hyperliquid交易器
-func NewHyperliquidTrader(privateKeyHex string, testnet bool) (*HyperliquidTrader, error) {
+func NewHyperliquidTrader(privateKeyHex string, walletAddr string, testnet bool) (*HyperliquidTrader, error) {
 	// 解析私钥
 	privateKey, err := crypto.HexToECDSA(privateKeyHex)
 	if err != nil {
@@ -33,13 +32,13 @@ func NewHyperliquidTrader(privateKeyHex string, testnet bool) (*HyperliquidTrade
 		apiURL = hyperliquid.TestnetAPIURL
 	}
 
-	// 从私钥生成钱包地址
-	pubKey := privateKey.Public()
-	publicKeyECDSA, ok := pubKey.(*ecdsa.PublicKey)
-	if !ok {
-		return nil, fmt.Errorf("无法转换公钥")
-	}
-	walletAddr := crypto.PubkeyToAddress(*publicKeyECDSA).Hex()
+	// // 从私钥生成钱包地址
+	// pubKey := privateKey.Public()
+	// publicKeyECDSA, ok := pubKey.(*ecdsa.PublicKey)
+	// if !ok {
+	// 	return nil, fmt.Errorf("无法转换公钥")
+	// }
+	// walletAddr := crypto.PubkeyToAddress(*publicKeyECDSA).Hex()
 
 	ctx := context.Background()
 
@@ -85,9 +84,7 @@ func (t *HyperliquidTrader) GetBalance() (map[string]interface{}, error) {
 	result := make(map[string]interface{})
 
 	accountValue, _ := strconv.ParseFloat(accountState.MarginSummary.AccountValue, 64)
-	totalMarginUsed, _ := strconv.ParseFloat(accountState.CrossMarginSummary.TotalMarginUsed, 64)
-	availableBalance, _ := strconv.ParseFloat(accountState.CrossMarginSummary.AccountValue, 64)
-	// Hyperliquid SDK未提供free collateral字段时，保留占用保证金用于日志
+	totalMarginUsed, _ := strconv.ParseFloat(accountState.MarginSummary.TotalMarginUsed, 64)
 
 	// ⚠️ 关键修复：从所有持仓中累加真正的未实现盈亏
 	totalUnrealizedPnl := 0.0
@@ -97,21 +94,23 @@ func (t *HyperliquidTrader) GetBalance() (map[string]interface{}, error) {
 	}
 
 	// ✅ 正确理解Hyperliquid字段：
-	// AccountValue = 账户净值（包含未实现盈亏）= 这是真正的总资产
-	// 钱包余额（已实现）= AccountValue - 未实现盈亏
-	walletBalance := accountValue - totalUnrealizedPnl
+	// AccountValue = 总账户净值（已包含空闲资金+持仓价值+未实现盈亏）
+	// TotalMarginUsed = 持仓占用的保证金（已包含在AccountValue中，仅用于显示）
+	//
+	// 为了兼容auto_trader.go的计算逻辑（totalEquity = totalWalletBalance + totalUnrealizedProfit）
+	// 需要返回"不包含未实现盈亏的钱包余额"
+	walletBalanceWithoutUnrealized := accountValue - totalUnrealizedPnl
 
-	result["totalWalletBalance"] = walletBalance // 钱包余额（已实现部分）
-	// 将可用余额设为账户净值，避免过低显示（如需严格口径可改为 accountValue - totalMarginUsed）
-	result["availableBalance"] = availableBalance
-	result["totalUnrealizedProfit"] = totalUnrealizedPnl // 未实现盈亏
+	result["totalWalletBalance"] = walletBalanceWithoutUnrealized // 钱包余额（不含未实现盈亏）
+	result["availableBalance"] = accountValue - totalMarginUsed   // 可用余额（总净值 - 占用保证金）
+	result["totalUnrealizedProfit"] = totalUnrealizedPnl          // 未实现盈亏
 
-	log.Printf("✓ Hyperliquid API返回: 账户净值=%.2f, 钱包余额=%.2f, 可用=%.2f (usedMargin=%.2f), 未实现盈亏=%.2f",
+	log.Printf("✓ Hyperliquid 账户: 总净值=%.2f (钱包%.2f+未实现%.2f), 可用=%.2f, 保证金占用=%.2f",
 		accountValue,
-		result["totalWalletBalance"],
+		walletBalanceWithoutUnrealized,
+		totalUnrealizedPnl,
 		result["availableBalance"],
-		totalMarginUsed,
-		result["totalUnrealizedProfit"])
+		totalMarginUsed)
 
 	return result, nil
 }

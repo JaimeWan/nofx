@@ -29,6 +29,7 @@ type AutoTraderConfig struct {
 
 	// Hyperliquid配置
 	HyperliquidPrivateKey string
+	HyperliquidWalletAddr string
 	HyperliquidTestnet    bool
 
 	// Aster配置
@@ -142,7 +143,7 @@ func NewAutoTrader(config AutoTraderConfig) (*AutoTrader, error) {
 		trader = NewFuturesTrader(config.BinanceAPIKey, config.BinanceSecretKey)
 	case "hyperliquid":
 		log.Printf("🏦 [%s] 使用Hyperliquid交易", config.Name)
-		trader, err = NewHyperliquidTrader(config.HyperliquidPrivateKey, config.HyperliquidTestnet)
+		trader, err = NewHyperliquidTrader(config.HyperliquidPrivateKey, config.HyperliquidWalletAddr, config.HyperliquidTestnet)
 		if err != nil {
 			return nil, fmt.Errorf("初始化Hyperliquid交易器失败: %w", err)
 		}
@@ -430,14 +431,6 @@ func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
 		unrealizedPnl := pos["unRealizedProfit"].(float64)
 		liquidationPrice := pos["liquidationPrice"].(float64)
 
-		// 计算盈亏百分比
-		pnlPct := 0.0
-		if side == "long" {
-			pnlPct = ((markPrice - entryPrice) / entryPrice) * 100
-		} else {
-			pnlPct = ((entryPrice - markPrice) / entryPrice) * 100
-		}
-
 		// 计算占用保证金（估算）
 		leverage := 10 // 默认值，实际应该从持仓信息获取
 		if lev, ok := pos["leverage"].(float64); ok {
@@ -445,6 +438,14 @@ func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
 		}
 		marginUsed := (quantity * markPrice) / float64(leverage)
 		totalMarginUsed += marginUsed
+
+		// 计算盈亏百分比
+		pnlPct := 0.0
+		if side == "long" {
+			pnlPct = ((markPrice - entryPrice) / entryPrice) * float64(leverage) * 100
+		} else {
+			pnlPct = ((entryPrice - markPrice) / entryPrice) * float64(leverage) * 100
+		}
 
 		// 跟踪持仓首次出现时间
 		posKey := symbol + "_" + side
@@ -513,8 +514,9 @@ func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
 		marginUsedPct = (totalMarginUsed / totalEquity) * 100
 	}
 
-	// 5. 分析历史表现（最近20个周期）
-	performance, err := at.decisionLogger.AnalyzePerformance(20)
+	// 5. 分析历史表现（最近100个周期，避免长期持仓的交易记录丢失）
+	// 假设每3分钟一个周期，100个周期 = 5小时，足够覆盖大部分交易
+	performance, err := at.decisionLogger.AnalyzePerformance(100)
 	if err != nil {
 		log.Printf("⚠️  分析历史表现失败: %v", err)
 		// 不影响主流程，继续执行（但设置performance为nil以避免传递错误数据）
@@ -879,9 +881,9 @@ func (at *AutoTrader) GetPositions() ([]map[string]interface{}, error) {
 
 		pnlPct := 0.0
 		if side == "long" {
-			pnlPct = ((markPrice - entryPrice) / entryPrice) * 100
+			pnlPct = ((markPrice - entryPrice) / entryPrice) * float64(leverage) * 100
 		} else {
-			pnlPct = ((entryPrice - markPrice) / entryPrice) * 100
+			pnlPct = ((entryPrice - markPrice) / entryPrice) * float64(leverage) * 100
 		}
 
 		marginUsed := (quantity * markPrice) / float64(leverage)
