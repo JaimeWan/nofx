@@ -333,6 +333,21 @@ func sortAndFilterLevels(levels []SupportResistanceLevel, isSupport bool) []Supp
 		return []SupportResistanceLevel{}
 	}
 
+	// 过滤低强度支撑阻力位，减少噪音
+	// 只保留强度 > 10 的级别（高强度支撑阻力位）
+	filtered := make([]SupportResistanceLevel, 0, len(levels))
+	for _, level := range levels {
+		// 强度 > 10 的级别才保留（至少触碰10次以上）
+		if level.Strength > 10 {
+			filtered = append(filtered, level)
+		}
+	}
+	levels = filtered
+
+	if len(levels) == 0 {
+		return []SupportResistanceLevel{}
+	}
+
 	sort.SliceStable(levels, func(i, j int) bool {
 		if levels[i].Score == levels[j].Score {
 			if levels[i].Strength == levels[j].Strength {

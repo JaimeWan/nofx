@@ -56,7 +56,12 @@ type Data struct {
 	IntradaySeries    *IntradayData
 	LongerTermContext *LongerTermData
 	OITopData         *OITopData // OI Top数据
-	SupportResistance *SupportResistanceSummary
+	Klines3m          []Kline    // 3分钟K线数据
+	Klines15m         []Kline    // 15分钟K线数据
+	Klines1h          []Kline    // 1小时K线数据
+	Klines4h          []Kline    // 4小时K线数据
+	Klines12h         []Kline    // 12小时K线数据
+	Klines1d          []Kline    // 1日K线数据
 }
 
 // OITopData OI Top数据结构
@@ -201,9 +206,6 @@ func Get(symbol string, exchange string) (*Data, error) {
 	// 计算长期数据
 	longerTermData := calculateLongerTermData(klines4h)
 
-	// 计算支撑阻力摘要
-	supportResistance := calculateSupportResistanceSummary(klines3m, klines15m, klines1h, klines4h, klines12h, klines1d, currentPrice)
-
 	return &Data{
 		Symbol:            symbol,
 		CurrentPrice:      currentPrice,
@@ -216,7 +218,12 @@ func Get(symbol string, exchange string) (*Data, error) {
 		FundingRate:       fundingRate,
 		IntradaySeries:    intradayData,
 		LongerTermContext: longerTermData,
-		SupportResistance: supportResistance,
+		Klines3m:          klines3m,
+		Klines15m:         klines15m,
+		Klines1h:          klines1h,
+		Klines4h:          klines4h,
+		Klines12h:         klines12h,
+		Klines1d:          klines1d,
 	}, nil
 }
 
@@ -678,7 +685,7 @@ func getFundingRate(symbol string) (float64, error) {
 }
 
 // Format 格式化输出市场数据
-func Format(data *Data) string {
+func Format(data *Data, isPosition bool) string {
 	var sb strings.Builder
 
 	sb.WriteString(fmt.Sprintf("当前价格 = %.2f, EMA20 = %.3f, MACD = %.3f, RSI(7) = %.3f\n\n",
@@ -768,29 +775,91 @@ func Format(data *Data) string {
 		}
 	}
 
-	if data.SupportResistance != nil && len(data.SupportResistance.Timeframes) > 0 {
-		sb.WriteString("支撑/阻力结构:\n\n")
+	// 显示K线数据（供AI自己分析支撑阻力位）
+	sb.WriteString("K线数据（供分析支撑/阻力位）:\n\n")
 
-		ordered := []string{"3m", "15m", "1h", "4h", "12h", "1d"}
-		for _, tf := range ordered {
-			if tfData, ok := data.SupportResistance.Timeframes[tf]; ok {
-				sb.WriteString(fmt.Sprintf("[%s] 支撑: %s\n", tf, formatSupportResistanceSlice(tfData.Supports, 3)))
-				sb.WriteString(fmt.Sprintf("[%s] 阻力: %s\n\n", tf, formatSupportResistanceSlice(tfData.Resistances, 3)))
-			}
-		}
+	// 优化策略：根据是否为持仓币种决定显示策略以节省tokens
+	// 持仓币种：显示所有周期（15m, 1h, 4h, 12h, 1d），每个周期100根，格式：时间戳|开|高|低|收|成交量
+	// 候选币种：显示关键周期（15m, 1h, 4h, 1d），每个周期100根，格式：时间戳|开|高|低|收|成交量
+	var klineCount int
+	var show15m, show12h bool
 
-		if data.SupportResistance.Confluence != nil {
-			baseLabel := "3m"
-			if _, ok := data.SupportResistance.Timeframes["3m"]; !ok {
-				baseLabel = "15m"
-			}
-			sb.WriteString(fmt.Sprintf("多周期共振 (%s 与长周期重合):\n", baseLabel))
-			sb.WriteString(fmt.Sprintf("共振支撑: %s\n", formatSupportResistanceSlice(data.SupportResistance.Confluence.Supports, 3)))
-			sb.WriteString(fmt.Sprintf("共振阻力: %s\n\n", formatSupportResistanceSlice(data.SupportResistance.Confluence.Resistances, 3)))
-		}
-
-		sb.WriteString("⚠️ 交易原则: 禁止在阻力位追多，也禁止在支撑位追空。\n\n")
+	if isPosition {
+		klineCount = 100 // 持仓币种显示100根
+		show15m = true
+		show12h = true
+	} else {
+		klineCount = 100 // 候选币种显示100根
+		show15m = true   // 候选币种也显示15分钟K线
+		show12h = false
 	}
+
+	if show15m && len(data.Klines15m) > 0 {
+		sb.WriteString(fmt.Sprintf("[15分钟K线] 最近%d根（格式：时间戳|开|高|低|收|成交量）:\n", klineCount))
+		start := len(data.Klines15m) - klineCount
+		if start < 0 {
+			start = 0
+		}
+		for i := start; i < len(data.Klines15m); i++ {
+			k := data.Klines15m[i]
+			sb.WriteString(fmt.Sprintf("  %d|%.4f|%.4f|%.4f|%.4f|%.2f\n", k.OpenTime, k.Open, k.High, k.Low, k.Close, k.Volume))
+		}
+		sb.WriteString("\n")
+	}
+
+	if len(data.Klines1h) > 0 {
+		sb.WriteString(fmt.Sprintf("[1小时K线] 最近%d根（格式：时间戳|开|高|低|收|成交量）:\n", klineCount))
+		start := len(data.Klines1h) - klineCount
+		if start < 0 {
+			start = 0
+		}
+		for i := start; i < len(data.Klines1h); i++ {
+			k := data.Klines1h[i]
+			sb.WriteString(fmt.Sprintf("  %d|%.4f|%.4f|%.4f|%.4f|%.2f\n", k.OpenTime, k.Open, k.High, k.Low, k.Close, k.Volume))
+		}
+		sb.WriteString("\n")
+	}
+
+	if len(data.Klines4h) > 0 {
+		sb.WriteString(fmt.Sprintf("[4小时K线] 最近%d根（格式：时间戳|开|高|低|收|成交量）:\n", klineCount))
+		start := len(data.Klines4h) - klineCount
+		if start < 0 {
+			start = 0
+		}
+		for i := start; i < len(data.Klines4h); i++ {
+			k := data.Klines4h[i]
+			sb.WriteString(fmt.Sprintf("  %d|%.4f|%.4f|%.4f|%.4f|%.2f\n", k.OpenTime, k.Open, k.High, k.Low, k.Close, k.Volume))
+		}
+		sb.WriteString("\n")
+	}
+
+	if show12h && len(data.Klines12h) > 0 {
+		sb.WriteString(fmt.Sprintf("[12小时K线] 最近%d根（格式：时间戳|开|高|低|收|成交量）:\n", klineCount))
+		start := len(data.Klines12h) - klineCount
+		if start < 0 {
+			start = 0
+		}
+		for i := start; i < len(data.Klines12h); i++ {
+			k := data.Klines12h[i]
+			sb.WriteString(fmt.Sprintf("  %d|%.4f|%.4f|%.4f|%.4f|%.2f\n", k.OpenTime, k.Open, k.High, k.Low, k.Close, k.Volume))
+		}
+		sb.WriteString("\n")
+	}
+
+	if len(data.Klines1d) > 0 {
+		sb.WriteString(fmt.Sprintf("[1日K线] 最近%d根（格式：时间戳|开|高|低|收|成交量）:\n", klineCount))
+		start := len(data.Klines1d) - klineCount
+		if start < 0 {
+			start = 0
+		}
+		for i := start; i < len(data.Klines1d); i++ {
+			k := data.Klines1d[i]
+			sb.WriteString(fmt.Sprintf("  %d|%.4f|%.4f|%.4f|%.4f|%.2f\n", k.OpenTime, k.Open, k.High, k.Low, k.Close, k.Volume))
+		}
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString("⚠️ 重要提示: 请根据K线数据自行分析支撑/阻力位，识别哪些阻力位已经突破转为支撑，哪些支撑位已经跌破转为阻力。\n\n")
 
 	return sb.String()
 }

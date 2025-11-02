@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"nofx/logger"
 	"nofx/market"
 	"nofx/mcp"
 	"strings"
@@ -75,19 +76,21 @@ type Context struct {
 	Exchange               string                       `json:"-"` // 交易所类型: "binance", "hyperliquid", "aster"
 	MaxPositionCount       int                          `json:"-"` // 最多持仓币种数量
 	SingleTradeMarginRatio float64                      `json:"-"` // 单笔开仓保证金比例（0-1）
+	DecisionLogger         *logger.DecisionLogger       `json:"-"` // 决策日志记录器，用于获取历史思维链
 }
 
 // Decision AI的交易决策
 type Decision struct {
-	Symbol          string  `json:"symbol"`
-	Action          string  `json:"action"` // "open_long", "open_short", "close_long", "close_short", "hold", "wait"
-	Leverage        int     `json:"leverage,omitempty"`
-	PositionSizeUSD float64 `json:"position_size_usd,omitempty"`
-	StopLoss        float64 `json:"stop_loss,omitempty"`
-	TakeProfit      float64 `json:"take_profit,omitempty"`
-	Confidence      int     `json:"confidence,omitempty"` // 信心度 (0-100)
-	RiskUSD         float64 `json:"risk_usd,omitempty"`   // 最大美元风险
-	Reasoning       string  `json:"reasoning"`
+	Symbol             string  `json:"symbol"`
+	Action             string  `json:"action"` // "open_long", "open_short", "close_long", "close_short", "hold", "wait"
+	Leverage           int     `json:"leverage,omitempty"`
+	PositionSizeUSD    float64 `json:"position_size_usd,omitempty"`
+	StopLoss           float64 `json:"stop_loss,omitempty"`
+	TakeProfit         float64 `json:"take_profit,omitempty"`
+	Confidence         int     `json:"confidence,omitempty"`           // 信心度 (0-100)
+	RiskUSD            float64 `json:"risk_usd,omitempty"`             // 最大美元风险
+	ObservationTimeMin int     `json:"observation_time_min,omitempty"` // 持仓观察时间（分钟），开仓时必填
+	Reasoning          string  `json:"reasoning"`
 }
 
 // FullDecision AI的完整决策（包含思维链）
@@ -99,31 +102,154 @@ type FullDecision struct {
 }
 
 // GetFullDecision 获取AI的完整交易决策（批量分析所有币种和持仓）
+// 采用分批处理策略，避免token超限，同时提供更详细的数据给LLM
 func GetFullDecision(ctx *Context, mcpClient *mcp.Client) (*FullDecision, error) {
 	// 1. 为所有币种获取市场数据
 	if err := fetchMarketDataForContext(ctx); err != nil {
 		return nil, fmt.Errorf("获取市场数据失败: %w", err)
 	}
 
-	// 2. 构建 System Prompt（固定规则）和 User Prompt（动态数据）
+	// 2. 构建 System Prompt（固定规则）
 	systemPrompt := buildSystemPrompt(ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage, ctx.MaxPositionCount, ctx.SingleTradeMarginRatio)
-	userPrompt := buildUserPrompt(ctx)
 
-	// 3. 调用AI API（使用 system + user prompt）
-	aiResponse, err := mcpClient.CallWithMessages(systemPrompt, userPrompt)
-	if err != nil {
-		return nil, fmt.Errorf("调用AI API失败: %w", err)
+	// 3. 分批处理：将币种分组，每次只分析一部分
+	const batchSize = 2 // 每批处理的候选币种数量（持仓币种单独处理或合并处理）
+
+	// 准备持仓币种列表
+	positionSymbols := make([]string, 0, len(ctx.Positions))
+	for _, pos := range ctx.Positions {
+		positionSymbols = append(positionSymbols, pos.Symbol)
 	}
 
-	// 4. 解析AI响应
-	decision, err := parseFullDecisionResponse(aiResponse, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage, ctx.Account.AvailableBalance, ctx.SingleTradeMarginRatio)
-	if err != nil {
-		return nil, fmt.Errorf("解析AI响应失败: %w", err)
+	// 准备候选币种列表（只包含有市场数据的）
+	candidateSymbols := make([]string, 0)
+	candidateCoinMap := make(map[string]CandidateCoin) // symbol -> CandidateCoin
+	for _, coin := range ctx.CandidateCoins {
+		if _, hasData := ctx.MarketDataMap[coin.Symbol]; hasData {
+			candidateSymbols = append(candidateSymbols, coin.Symbol)
+			candidateCoinMap[coin.Symbol] = coin
+		}
 	}
 
-	decision.Timestamp = time.Now()
-	decision.UserPrompt = userPrompt // 保存输入prompt
-	return decision, nil
+	// 4. 分批调用AI API并汇总结果
+	allDecisions := make([]Decision, 0)
+	allCoTTraces := make([]string, 0)
+	var fullUserPrompt strings.Builder // 用于记录完整的user prompt
+
+	// 如果持仓币种较少（<=3个），可以与第一批候选币种合并处理
+	// 否则持仓币种单独一批处理
+	positionBatchHandled := false
+	if len(positionSymbols) > 0 && len(positionSymbols) <= 3 && len(candidateSymbols) > 0 {
+		// 持仓币种与第一批候选币种合并
+		firstBatchCandidates := candidateSymbols
+		if len(firstBatchCandidates) > batchSize {
+			firstBatchCandidates = firstBatchCandidates[:batchSize]
+		}
+
+		userPrompt := buildUserPromptBatch(ctx, positionSymbols, firstBatchCandidates, candidateCoinMap, len(candidateSymbols), 1)
+		fullUserPrompt.WriteString("=== 批次 1 (持仓 + 候选币种) ===\n")
+		fullUserPrompt.WriteString(userPrompt)
+		fullUserPrompt.WriteString("\n\n")
+
+		log.Printf("📊 批次 1: 分析 %d 个持仓币种 + %d 个候选币种", len(positionSymbols), len(firstBatchCandidates))
+		aiResponse, err := mcpClient.CallWithMessages(systemPrompt, userPrompt)
+		if err != nil {
+			return nil, fmt.Errorf("批次1调用AI API失败: %w", err)
+		}
+
+		decision, err := parseFullDecisionResponse(aiResponse, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage, ctx.Account.AvailableBalance, ctx.SingleTradeMarginRatio)
+		if err != nil {
+			log.Printf("⚠️ 批次1解析失败: %v", err)
+		} else {
+			allDecisions = append(allDecisions, decision.Decisions...)
+			if decision.CoTTrace != "" {
+				allCoTTraces = append(allCoTTraces, fmt.Sprintf("=== 批次1思维链 ===\n%s", decision.CoTTrace))
+			}
+		}
+
+		positionBatchHandled = true
+		candidateSymbols = candidateSymbols[len(firstBatchCandidates):]
+	}
+
+	// 处理剩余的持仓币种（如果之前没有合并处理）
+	if len(positionSymbols) > 0 && !positionBatchHandled {
+		userPrompt := buildUserPromptBatch(ctx, positionSymbols, nil, candidateCoinMap, len(candidateSymbols), 0)
+		fullUserPrompt.WriteString("=== 批次 1 (持仓币种) ===\n")
+		fullUserPrompt.WriteString(userPrompt)
+		fullUserPrompt.WriteString("\n\n")
+
+		log.Printf("📊 批次 1: 分析 %d 个持仓币种", len(positionSymbols))
+		aiResponse, err := mcpClient.CallWithMessages(systemPrompt, userPrompt)
+		if err != nil {
+			return nil, fmt.Errorf("批次1(持仓)调用AI API失败: %w", err)
+		}
+
+		decision, err := parseFullDecisionResponse(aiResponse, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage, ctx.Account.AvailableBalance, ctx.SingleTradeMarginRatio)
+		if err != nil {
+			log.Printf("⚠️ 批次1(持仓)解析失败: %v", err)
+		} else {
+			allDecisions = append(allDecisions, decision.Decisions...)
+			if decision.CoTTrace != "" {
+				allCoTTraces = append(allCoTTraces, fmt.Sprintf("=== 批次1(持仓)思维链 ===\n%s", decision.CoTTrace))
+			}
+		}
+	}
+
+	// 分批处理候选币种
+	batchNum := 2
+	for i := 0; i < len(candidateSymbols); i += batchSize {
+		end := i + batchSize
+		if end > len(candidateSymbols) {
+			end = len(candidateSymbols)
+		}
+
+		batchCandidates := candidateSymbols[i:end]
+		userPrompt := buildUserPromptBatch(ctx, nil, batchCandidates, candidateCoinMap, len(candidateSymbols), batchNum)
+		fullUserPrompt.WriteString(fmt.Sprintf("=== 批次 %d (候选币种 %d-%d) ===\n", batchNum, i+1, end))
+		fullUserPrompt.WriteString(userPrompt)
+		fullUserPrompt.WriteString("\n\n")
+
+		log.Printf("📊 批次 %d: 分析 %d 个候选币种 (%d-%d)", batchNum, len(batchCandidates), i+1, end)
+		aiResponse, err := mcpClient.CallWithMessages(systemPrompt, userPrompt)
+		if err != nil {
+			log.Printf("⚠️ 批次%d调用AI API失败: %v，继续处理下一批", batchNum, err)
+			batchNum++
+			continue
+		}
+
+		decision, err := parseFullDecisionResponse(aiResponse, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage, ctx.Account.AvailableBalance, ctx.SingleTradeMarginRatio)
+		if err != nil {
+			log.Printf("⚠️ 批次%d解析失败: %v", batchNum, err)
+		} else {
+			allDecisions = append(allDecisions, decision.Decisions...)
+			if decision.CoTTrace != "" {
+				allCoTTraces = append(allCoTTraces, fmt.Sprintf("=== 批次%d思维链 ===\n%s", batchNum, decision.CoTTrace))
+			}
+		}
+
+		batchNum++
+	}
+
+	// 5. 汇总和清理所有批次的决策
+	// 5.1 去重和冲突处理：同一币种只保留第一个决策（后续批次的决策如果冲突会被忽略）
+	finalDecisions := deduplicateAndResolveConflicts(allDecisions)
+
+	// 5.2 最终验证：检查总持仓数限制、总保证金使用等
+	if err := validateFinalDecisions(finalDecisions, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage, ctx.Account.AvailableBalance, ctx.MaxPositionCount, ctx.SingleTradeMarginRatio); err != nil {
+		log.Printf("⚠️ 最终决策验证失败: %v，将返回部分决策", err)
+		// 不直接返回错误，而是记录日志并继续，让上层决定如何处理
+	}
+
+	// 5.3 构建最终结果
+	result := &FullDecision{
+		Decisions:  finalDecisions,
+		CoTTrace:   strings.Join(allCoTTraces, "\n\n"),
+		Timestamp:  time.Now(),
+		UserPrompt: fullUserPrompt.String(),
+	}
+
+	log.Printf("✅ 分批处理完成: 共 %d 个批次，汇总 %d 个决策（去重后 %d 个）", batchNum-1, len(allDecisions), len(finalDecisions))
+	return result, nil
 }
 
 // fetchMarketDataForContext 为上下文中的所有币种获取市场数据和OI数据
@@ -337,8 +463,45 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	sb.WriteString("**质量优于数量**：少量高信念交易胜过大量低信念交易\n\n")
 	sb.WriteString("**适应波动性**：根据市场条件调整仓位\n\n")
 	sb.WriteString("**尊重趋势**：不要与强趋势作对\n\n")
-	sb.WriteString("**支撑阻力优先**：多周期共振的支撑/阻力是最重要的价位，顺势靠近支撑才考虑做多，顶到阻力优先做空或减仓\n\n")
+	sb.WriteString("**🎯 核心分析方法（最高优先级）**：\n")
+	sb.WriteString("- 🔥 **支撑位/阻力位分析是决策的核心基础**：系统提供K线数据，你必须首先识别和分析关键支撑/阻力位\n")
+	sb.WriteString("- 🔥 **斐波那契分析是必执行步骤**：所有交易决策都必须基于斐波那契回撤和扩展分析\n")
+	sb.WriteString("- 🔥 **多周期共振是关键**：优先寻找多周期（15分钟、1小时、4小时、1日）斐波那契位与支撑/阻力位重合的区域\n")
+	sb.WriteString("- ⚠️ **重要**：支撑位/阻力位和斐波那契分析应该是你决策的主要依据，其他指标（MACD、RSI等）仅作为辅助确认\n\n")
+	sb.WriteString("**斐波那契分析**（⚠️ 必须执行）：\n")
+	sb.WriteString("- 📊 **使用斐波那契回撤和扩展**：基于15分钟、1小时、4小时、1日K线数据进行分析\n")
+	sb.WriteString("- 📈 **识别关键高低点**：从各周期K线中找出明显的波段高点和低点\n")
+	sb.WriteString("- 🔢 **计算斐波那契位**：使用经典斐波那契回撤位（0.236, 0.382, 0.5, 0.618, 0.786）和扩展位（1.272, 1.618, 2.0, 2.618）\n")
+	sb.WriteString("- 🎯 **多周期共振**：重点识别多个周期（15分钟、1小时、4小时、1日）斐波那契位重合的区域，这些是关键支撑/阻力位\n")
+	sb.WriteString("- ⚠️ **交易应用**：\n")
+	sb.WriteString("  • 在上涨趋势中，回撤到斐波那契支撑位（0.382, 0.5, 0.618）附近寻找做多机会\n")
+	sb.WriteString("  • 在下跌趋势中，反弹到斐波那契阻力位附近寻找做空机会\n")
+	sb.WriteString("  • 突破关键斐波那契位后，使用扩展位（1.272, 1.618）作为目标位\n\n")
+	sb.WriteString("**斐波那契0.618共振交易信号**（⚠️ 重要交易规则）：\n")
+	sb.WriteString("- 🎯 **做多信号**：如果0.618斐波那契回撤位与某个强有力的支撑位（如历史低点、前支撑位、多周期共振支撑位等）形成共振，价格回撤到该位置附近时，这是强做多信号\n")
+	sb.WriteString("- 🎯 **做空信号**：如果0.618斐波那契回撤位（在下跌趋势中相当于反弹阻力位）与某个强有力的阻力位（如历史高点、前阻力位、多周期共振阻力位等）形成共振，价格反弹到该位置附近时，这是强做空信号\n")
+	sb.WriteString("- ⚠️ **共振判断标准**：\n")
+	sb.WriteString("  • 斐波那契位与关键支撑/阻力位的价格差异在0.5%以内，视为共振\n")
+	sb.WriteString("  • 多周期（至少2个周期）同时出现共振，信号更强\n")
+	sb.WriteString("  • 结合成交量、K线形态（如锤子线、吞没形态等）确认信号强度\n")
+	sb.WriteString("- 📊 **交易优先级**：0.618共振信号是高质量交易机会，优先级高于单一斐波那契位或单一支撑/阻力位\n\n")
+	sb.WriteString("**支撑阻力位转换分析**（⚠️ 必须执行）：\n")
+	sb.WriteString("- 📊 **结合K线和斐波那契**：根据K线数据和高低点，使用斐波那契分析识别关键支撑/阻力位\n")
+	sb.WriteString("- 🔍 **必须分析**：哪些阻力位（包括斐波那契阻力位）已经被突破转为支撑位（当前价格已在该阻力位上方）\n")
+	sb.WriteString("- 🔍 **必须分析**：哪些支撑位（包括斐波那契支撑位）已经被跌破转为阻力位（当前价格已在该支撑位下方）\n")
+	sb.WriteString("- 📊 **判断依据**：通过比较当前价格与K线数据中的关键高低点和斐波那契位的位置关系\n")
+	sb.WriteString("- 🎯 **交易意义**：突破后的阻力转支撑位成为新的支撑，跌破后的支撑转阻力位成为新的阻力\n")
+	sb.WriteString("- ⚠️ **重要**：重点关注多周期共振的关键价位（特别是斐波那契位重合的区域），这些位置通常更重要\n\n")
 	sb.WriteString("**级别匹配策略**：当信号来自4h/12h/1d等较高周期的支撑或阻力时，必须相应拉大止盈距离、延长持有时间，不得只顾短时波动；至少计划风险回报≥1:4，并给出持仓时间目标。\n\n")
+	sb.WriteString("**持仓观察时间要求**：\n")
+	sb.WriteString("- 每次开仓时必须在JSON中返回 `observation_time_min` 字段（分钟）\n")
+	sb.WriteString("- 表示你计划持有该仓位多长时间进行观察和评估\n")
+	sb.WriteString("- 最短30分钟，根据信号级别调整：\n")
+	sb.WriteString("  • 3分钟级别信号：30-60分钟\n")
+	sb.WriteString("  • 15分钟级别信号：60-120分钟\n")
+	sb.WriteString("  • 1小时级别信号：120-240分钟\n")
+	sb.WriteString("  • 4小时及以上级别信号：240分钟以上\n")
+	sb.WriteString("- 在观察时间内，除非触发止损或止盈，否则应保持持仓\n\n")
 	sb.WriteString("## 常见误区避免：\n\n")
 	sb.WriteString("⚠️ **过度交易**：频繁交易导致费用侵蚀利润\n\n")
 	sb.WriteString("⚠️ **复仇式交易**：亏损后立即加码试图\"翻本\"\n\n")
@@ -360,17 +523,32 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	// === 开仓信号强度 ===
 	sb.WriteString("# 🎯 开仓标准（严格）\n\n")
 	sb.WriteString("只在**强信号**时开仓，不确定就观望。\n\n")
-	sb.WriteString("**你拥有的完整数据**：\n")
-	sb.WriteString("- 📊 **原始序列**：3分钟价格序列(MidPrices数组) + 4小时K线序列\n")
+	sb.WriteString("**🔥 核心分析方法（必须优先执行）**：\n\n")
+	sb.WriteString("**第一步：支撑位/阻力位识别（必执行）**：\n")
+	sb.WriteString("- 📊 仔细分析K线数据（15分钟、1小时、4小时、12小时、1日），识别关键的高点和低点\n")
+	sb.WriteString("- 📊 标记历史价格多次触及但未突破的位置（这些是强支撑/阻力位）\n")
+	sb.WriteString("- 📊 识别整数位、心理价位等关键位置\n")
+	sb.WriteString("- 📊 分析哪些阻力位已突破转为支撑，哪些支撑位已跌破转为阻力\n\n")
+	sb.WriteString("**第二步：斐波那契分析（必执行）**：\n")
+	sb.WriteString("- 🔢 基于15分钟、1小时、4小时、1日K线数据，识别关键波段高点和低点\n")
+	sb.WriteString("- 🔢 计算斐波那契回撤位（0.236, 0.382, 0.5, 0.618, 0.786）和扩展位（1.272, 1.618, 2.0, 2.618）\n")
+	sb.WriteString("- 🔢 识别多周期斐波那契位重合的区域（这些是关键支撑/阻力位）\n")
+	sb.WriteString("- 🔢 分析当前价格相对于各周期斐波那契位的位置\n")
+	sb.WriteString("- 🔢 特别关注0.618斐波那契位与其他支撑/阻力位的共振\n\n")
+	sb.WriteString("**第三步：多周期共振分析（必执行）**：\n")
+	sb.WriteString("- 🎯 找出多个周期（至少2个周期）的斐波那契位与支撑/阻力位重合的区域\n")
+	sb.WriteString("- 🎯 这些共振区域是最高质量的交易机会\n")
+	sb.WriteString("- 🎯 优先考虑这些共振区域附近的交易信号\n\n")
+	sb.WriteString("**辅助数据**（用于确认信号强度）：\n")
 	sb.WriteString("- 📈 **技术序列**：EMA20序列、MACD序列、RSI7序列、RSI14序列\n")
 	sb.WriteString("- 💰 **资金序列**：成交量序列、持仓量(OI)序列、资金费率\n")
 	sb.WriteString("- 🎯 **筛选标记**：AI500评分 / OI_Top排名（如果有标注）\n\n")
-	sb.WriteString("**分析方法**（完全由你自主决定）：\n")
-	sb.WriteString("- 首先确认当前价格与多周期共振支撑/阻力之间的关系，必须顺势并尊重关键位\n")
-	sb.WriteString("- 自由运用序列数据，你可以做但不限于趋势分析、形态识别、支撑阻力、斐波那契、波动带计算\n")
-	sb.WriteString("- 多维度交叉验证（价格+量+持仓量+指标+形态），支撑位只寻找做多机会，阻力位只考虑做空或减仓\n")
+	sb.WriteString("**⚠️ 重要决策原则**：\n")
+	sb.WriteString("- 🔥 **优先依据**：支撑位/阻力位和斐波那契分析应该是你决策的主要依据\n")
+	sb.WriteString("- 🔥 **辅助确认**：其他技术指标（MACD、RSI等）仅作为辅助确认，不应作为主要决策依据\n")
+	sb.WriteString("- 🔥 **交易规则**：支撑位只寻找做多机会，阻力位只考虑做空或减仓\n")
+	sb.WriteString("- 🔥 **共振优先**：多周期斐波那契位与支撑/阻力位共振的信号优先级最高\n")
 	sb.WriteString("- 如果计划的止损/止盈基于4h及以上周期，请同步拉大持仓时长与目标收益，保持耐心，不可在短期波动中仓促退出\n")
-	sb.WriteString("- 用你认为最有效的方法发现高确定性机会\n")
 	sb.WriteString("- 综合信心度 ≥ 75 才开仓\n\n")
 	sb.WriteString("**避免低质量信号**：\n")
 	sb.WriteString("- 单一维度（只看一个指标）\n")
@@ -402,23 +580,35 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	sb.WriteString("# 📋 决策流程\n\n")
 	sb.WriteString("1. **分析夏普比率**: 当前策略是否有效？需要调整吗？\n")
 	sb.WriteString("2. **评估持仓**: 趋势是否改变？是否该止盈/止损？\n")
-	sb.WriteString("3. **寻找新机会**: 有强信号吗？多空机会？\n")
-	sb.WriteString("4. **输出决策**: 思维链分析 + JSON\n\n")
+	sb.WriteString("3. **寻找新机会**（🔥 核心步骤）：\n")
+	sb.WriteString("   a. **首先分析支撑位/阻力位**：基于K线数据识别关键价位\n")
+	sb.WriteString("   b. **执行斐波那契分析**：计算各周期的斐波那契回撤和扩展位\n")
+	sb.WriteString("   c. **寻找多周期共振**：找出斐波那契位与支撑/阻力位重合的区域\n")
+	sb.WriteString("   d. **评估交易信号**：优先考虑共振区域的交易机会\n")
+	sb.WriteString("   e. **辅助确认**：使用其他技术指标（MACD、RSI等）确认信号强度\n")
+	sb.WriteString("4. **输出决策**: 思维链分析 + JSON（必须包含对支撑位/阻力位和斐波那契的分析说明）\n\n")
 
 	// === 输出格式 ===
 	sb.WriteString("# 📤 输出格式\n\n")
 	sb.WriteString("**第一步: 思维链（纯文本）**\n")
-	sb.WriteString("简洁分析你的思考过程\n\n")
+	sb.WriteString("简洁分析你的思考过程\n")
+	sb.WriteString("🔥 **必须包含以下分析内容**：\n")
+	sb.WriteString("- 支撑位/阻力位识别：你识别了哪些关键支撑位和阻力位？\n")
+	sb.WriteString("- 斐波那契分析：各周期的斐波那契回撤位和扩展位在哪里？\n")
+	sb.WriteString("- 多周期共振：是否有斐波那契位与支撑/阻力位重合的区域？\n")
+	sb.WriteString("- 当前价格位置：当前价格相对于这些关键价位的位置如何？\n")
+	sb.WriteString("- 交易信号判断：基于支撑位/阻力位和斐波那契分析得出的交易信号\n\n")
 	sb.WriteString("**第二步: JSON决策数组**\n\n")
 	sb.WriteString("```json\n[\n")
-	sb.WriteString(fmt.Sprintf("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_long\", \"leverage\": %d, \"position_size_usd\": %.0f, \"stop_loss\": 90000, \"take_profit\": 97000, \"confidence\": 85, \"risk_usd\": 300, \"reasoning\": \"上涨趋势+MACD金叉\"},\n", btcEthLeverage, accountEquity*5))
-	sb.WriteString(fmt.Sprintf("  {\"symbol\": \"ETHUSDT\", \"action\": \"open_short\", \"leverage\": %d, \"position_size_usd\": %.0f, \"stop_loss\": 3200, \"take_profit\": 3000, \"confidence\": 80, \"risk_usd\": 200, \"reasoning\": \"下跌趋势+MACD死叉\"},\n", btcEthLeverage, accountEquity*3))
-	sb.WriteString("  {\"symbol\": \"SOLUSDT\", \"action\": \"close_long\", \"reasoning\": \"止盈离场\"}\n")
+	sb.WriteString(fmt.Sprintf("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_long\", \"leverage\": %d, \"position_size_usd\": %.0f, \"stop_loss\": 90000, \"take_profit\": 97000, \"confidence\": 85, \"risk_usd\": 300, \"observation_time_min\": 60, \"reasoning\": \"价格回撤至0.618斐波那契支撑位+多周期共振+4h前阻力位转支撑，MACD确认\"},\n", btcEthLeverage, accountEquity*5))
+	sb.WriteString(fmt.Sprintf("  {\"symbol\": \"ETHUSDT\", \"action\": \"open_short\", \"leverage\": %d, \"position_size_usd\": %.0f, \"stop_loss\": 3200, \"take_profit\": 3000, \"confidence\": 80, \"risk_usd\": 200, \"observation_time_min\": 90, \"reasoning\": \"价格反弹至0.618斐波那契阻力位+1h和4h周期共振+前高点阻力位，RSI超买确认\"},\n", btcEthLeverage, accountEquity*3))
+	sb.WriteString("  {\"symbol\": \"SOLUSDT\", \"action\": \"close_long\", \"reasoning\": \"达到1.618斐波那契扩展目标位+前阻力位，止盈离场\"}\n")
 	sb.WriteString("]\n```\n\n")
 	sb.WriteString("**字段说明**:\n")
 	sb.WriteString("- `action`: open_long | open_short | close_long | close_short | hold | wait\n")
 	sb.WriteString("- `confidence`: 0-100（开仓建议≥75）\n")
-	sb.WriteString("- 开仓时必填: leverage, position_size_usd, stop_loss, take_profit, confidence, risk_usd, reasoning\n\n")
+	sb.WriteString("- `observation_time_min`: 持仓观察时间（分钟），开仓时必填。表示你计划持有该仓位多长时间进行观察，至少30分钟以上。\n")
+	sb.WriteString("- 开仓时必填: leverage, position_size_usd, stop_loss, take_profit, confidence, risk_usd, observation_time_min, reasoning\n\n")
 
 	// === 关键提醒 ===
 	sb.WriteString("---\n\n")
@@ -438,25 +628,188 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	return sb.String()
 }
 
-func summarizeConfluenceLevels(levels []market.SupportResistanceLevel, limit int) string {
-	if len(levels) == 0 {
-		return "-"
+// summarizeConfluenceLevels 已移除，不再使用支撑阻力位数据
+
+// buildUserPromptBatch 构建单批币种的 User Prompt（用于分批处理）
+// positionSymbols: 本批要分析的持仓币种符号列表
+// candidateSymbols: 本批要分析的候选币种符号列表
+// candidateCoinMap: 候选币种映射表（用于获取source信息等）
+// totalCandidates: 候选币种总数（用于显示进度）
+// batchNum: 批次编号（用于显示进度）
+func buildUserPromptBatch(ctx *Context, positionSymbols []string, candidateSymbols []string, candidateCoinMap map[string]CandidateCoin, totalCandidates int, batchNum int) string {
+	var sb strings.Builder
+
+	// 系统状态
+	sb.WriteString(fmt.Sprintf("**时间**: %s | **周期**: #%d | **运行**: %d分钟\n\n",
+		ctx.CurrentTime, ctx.CallCount, ctx.RuntimeMinutes))
+
+	// 批次信息
+	if batchNum > 0 {
+		sb.WriteString(fmt.Sprintf("**批次信息**: 这是第 %d 批次分析（候选币种总计 %d 个）\n\n", batchNum, totalCandidates))
 	}
 
-	if len(levels) > limit {
-		levels = levels[:limit]
+	// 白名单状态
+	if ctx.CoinWhitelistEnabled {
+		sb.WriteString(fmt.Sprintf("**币种白名单**: 已启用，仅交易以下%d个币种: %s\n\n",
+			len(ctx.CoinWhitelist), strings.Join(ctx.CoinWhitelist, ", ")))
+	} else {
+		sb.WriteString("**币种白名单**: 未启用，可交易所有币种\n\n")
 	}
 
-	parts := make([]string, len(levels))
-	for i, level := range levels {
-		parts[i] = fmt.Sprintf("%.2f(强度%d, 得分%.2f, 距离%.2f%%)",
-			level.Price, level.Strength, level.Score, level.Distance)
+	// BTC 市场
+	if btcData, hasBTC := ctx.MarketDataMap["BTCUSDT"]; hasBTC {
+		sb.WriteString(fmt.Sprintf("**BTC**: %.2f (1h: %+.2f%%, 4h: %+.2f%%) | MACD: %.4f | RSI: %.2f\n\n",
+			btcData.CurrentPrice, btcData.PriceChange1h, btcData.PriceChange4h,
+			btcData.CurrentMACD, btcData.CurrentRSI7))
 	}
 
-	return strings.Join(parts, " | ")
+	// 账户
+	sb.WriteString(fmt.Sprintf("**账户**: 净值%.2f | 余额%.2f (%.1f%%) | 盈亏%+.2f%% | 保证金%.1f%% | 持仓%d个\n\n",
+		ctx.Account.TotalEquity,
+		ctx.Account.AvailableBalance,
+		(ctx.Account.AvailableBalance/ctx.Account.TotalEquity)*100,
+		ctx.Account.TotalPnLPct,
+		ctx.Account.MarginUsedPct,
+		ctx.Account.PositionCount))
+
+	// 保证金使用信息
+	recommendedSingleTradeMargin := ctx.Account.TotalEquity * ctx.SingleTradeMarginRatio
+	actualAvailableBalance := ctx.Account.AvailableBalance
+
+	// 显示保证金基本信息
+	sb.WriteString(fmt.Sprintf("**保证金信息**: 可用余额%.2f USDT | 单笔标准保证金=%.0f USDT（账户净值的%.0f%%）\n\n",
+		actualAvailableBalance, recommendedSingleTradeMargin, ctx.SingleTradeMarginRatio*100))
+
+	// 保证金约束说明
+	if actualAvailableBalance > 0 {
+		sb.WriteString("**保证金约束**:\n")
+		sb.WriteString(fmt.Sprintf("   单笔保证金 = position_size_usd / leverage ≤ min(%.2f USDT（标准额度）, %.2f USDT（可用余额）)\n",
+			recommendedSingleTradeMargin, actualAvailableBalance))
+		sb.WriteString(fmt.Sprintf("   最大仓位大小 ≤ min(%.2f × leverage, %.2f × leverage)\n",
+			recommendedSingleTradeMargin, actualAvailableBalance))
+
+		// BTC/ETH 的最大仓位
+		if ctx.BTCETHLeverage > 0 {
+			maxBTCETHPosition := actualAvailableBalance * float64(ctx.BTCETHLeverage)
+			sb.WriteString(fmt.Sprintf("   BTC/ETH（%dx杠杆）最大仓位 = %.2f × %d = %.2f USDT\n", ctx.BTCETHLeverage, actualAvailableBalance, ctx.BTCETHLeverage, maxBTCETHPosition))
+		}
+
+		// 山寨币的最大仓位
+		if ctx.AltcoinLeverage > 0 {
+			maxAltcoinPosition := actualAvailableBalance * float64(ctx.AltcoinLeverage)
+			sb.WriteString(fmt.Sprintf("   山寨币（%dx杠杆）最大仓位 = %.2f × %d = %.2f USDT\n", ctx.AltcoinLeverage, actualAvailableBalance, ctx.AltcoinLeverage, maxAltcoinPosition))
+		}
+
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString("⚠️ 手续费提醒：开仓和平仓各收0.0432%，往返约0.0864%；净收益需扣除该成本后再评估。\n\n")
+
+	// 本批持仓币种（完整市场数据）
+	if len(positionSymbols) > 0 {
+		sb.WriteString(fmt.Sprintf("## 当前持仓（本批分析 %d 个）\n", len(positionSymbols)))
+		for i, symbol := range positionSymbols {
+			// 查找对应的持仓信息
+			var pos *PositionInfo
+			for j := range ctx.Positions {
+				if ctx.Positions[j].Symbol == symbol {
+					pos = &ctx.Positions[j]
+					break
+				}
+			}
+			if pos == nil {
+				continue
+			}
+
+			// 计算持仓时长
+			holdingDuration := ""
+			if pos.UpdateTime > 0 {
+				durationMs := time.Now().UnixMilli() - pos.UpdateTime
+				durationMin := durationMs / (1000 * 60)
+				if durationMin < 60 {
+					holdingDuration = fmt.Sprintf(" | 持仓时长%d分钟", durationMin)
+				} else {
+					durationHour := durationMin / 60
+					durationMinRemainder := durationMin % 60
+					holdingDuration = fmt.Sprintf(" | 持仓时长%d小时%d分钟", durationHour, durationMinRemainder)
+				}
+			}
+
+			sb.WriteString(fmt.Sprintf("%d. %s %s | 入场价%.4f 当前价%.4f | 盈亏%+.2f%% | 杠杆%dx | 保证金%.0f | 强平价%.4f%s\n\n",
+				i+1, pos.Symbol, strings.ToUpper(pos.Side),
+				pos.EntryPrice, pos.MarkPrice, pos.UnrealizedPnLPct,
+				pos.Leverage, pos.MarginUsed, pos.LiquidationPrice, holdingDuration))
+
+			// 使用FormatMarketData输出完整市场数据（持仓币种显示更多数据）
+			if marketData, ok := ctx.MarketDataMap[pos.Symbol]; ok {
+				sb.WriteString(market.Format(marketData, true)) // true表示是持仓币种
+				sb.WriteString("\n")
+			}
+		}
+	} else if batchNum == 0 {
+		// 只有批次0（持仓批次）才显示"无持仓"
+		sb.WriteString("**当前持仓**: 无\n\n")
+	}
+
+	// 本批候选币种（完整市场数据）
+	if len(candidateSymbols) > 0 {
+		sb.WriteString(fmt.Sprintf("## 候选币种（本批分析 %d 个）\n\n", len(candidateSymbols)))
+		displayedCount := 0
+		for _, symbol := range candidateSymbols {
+			marketData, hasData := ctx.MarketDataMap[symbol]
+			if !hasData {
+				continue
+			}
+			displayedCount++
+
+			// 获取候选币种信息
+			coin, hasCoin := candidateCoinMap[symbol]
+			sourceTags := ""
+			if hasCoin {
+				if len(coin.Sources) > 1 {
+					sourceTags = " (AI500+OI_Top双重信号)"
+				} else if len(coin.Sources) == 1 && coin.Sources[0] == "oi_top" {
+					sourceTags = " (OI_Top持仓增长)"
+				}
+
+				// 检查是否有Hyperliquid OI数据
+				if oiData, hasOIData := ctx.OITopDataMap[symbol]; hasOIData && oiData.OIDeltaValue > 0 {
+					if sourceTags == "" {
+						sourceTags = " (Hyperliquid OI数据)"
+					} else {
+						sourceTags += "+Hyperliquid OI"
+					}
+				}
+			}
+
+			// 使用FormatMarketData输出完整市场数据（候选币种显示精简数据以节省tokens）
+			sb.WriteString(fmt.Sprintf("### %d. %s%s\n\n", displayedCount, symbol, sourceTags))
+			sb.WriteString(market.Format(marketData, false)) // false表示是候选币种
+			sb.WriteString("\n")
+		}
+		sb.WriteString("\n")
+	}
+
+	// 夏普比率（直接传值，不要复杂格式化）
+	if ctx.Performance != nil {
+		type PerformanceData struct {
+			SharpeRatio float64 `json:"sharpe_ratio"`
+		}
+		var perfData PerformanceData
+		if jsonData, err := json.Marshal(ctx.Performance); err == nil {
+			if err := json.Unmarshal(jsonData, &perfData); err == nil {
+				sb.WriteString(fmt.Sprintf("## 📊 夏普比率: %.2f\n\n", perfData.SharpeRatio))
+			}
+		}
+	}
+
+	sb.WriteString("---\n\n")
+	sb.WriteString("现在请分析本批币种并输出决策（思维链 + JSON）\n")
+
+	return sb.String()
 }
 
-// buildUserPrompt 构建 User Prompt（动态数据）
+// buildUserPrompt 构建 User Prompt（动态数据）- 保留原函数用于兼容
 func buildUserPrompt(ctx *Context) string {
 	var sb strings.Builder
 
@@ -488,49 +841,21 @@ func buildUserPrompt(ctx *Context) string {
 		ctx.Account.MarginUsedPct,
 		ctx.Account.PositionCount))
 
-	// 保证金使用建议
-	availableMarginPct := 100.0 - ctx.Account.MarginUsedPct
+	// 保证金使用信息
 	recommendedSingleTradeMargin := ctx.Account.TotalEquity * ctx.SingleTradeMarginRatio // 使用配置的比例
 	actualAvailableBalance := ctx.Account.AvailableBalance                               // 实际可用余额
 
-	// 检查可用余额是否足够支付建议的保证金
-	if actualAvailableBalance < recommendedSingleTradeMargin {
-		// 可用余额不足，使用实际可用余额作为上限
-		if actualAvailableBalance > 0 {
-			sb.WriteString(fmt.Sprintf("⚠️ **资金不足警告**: 当前可用余额%.2f USDT < 标准单笔保证金%.0f USDT（账户净值%.2f × %.0f%%）！\n",
-				actualAvailableBalance, recommendedSingleTradeMargin, ctx.Account.TotalEquity, ctx.SingleTradeMarginRatio*100))
-			sb.WriteString(fmt.Sprintf("   单笔新开仓仍需以标准比例为目标，但受限于可用余额，当前上限为%.2f USDT。\n", actualAvailableBalance))
-			sb.WriteString("   建议：优先平仓释放保证金，或等待账户余额增加后再开仓\n\n")
-		} else {
-			sb.WriteString(fmt.Sprintf("🚨 **资金严重不足**: 当前可用余额为0或负数（%.2f USDT）！\n", actualAvailableBalance))
-			sb.WriteString("   无法开任何新仓，必须优先平仓释放保证金！\n\n")
-		}
-	} else {
-		// 可用余额充足，按正常逻辑显示
-		if ctx.Account.MarginUsedPct < 70 {
-			sb.WriteString(fmt.Sprintf("💡 **保证金建议**: 当前可用%.1f%% | 可用余额%.2f USDT | 单笔标准保证金=%.0f USDT（账户净值的%.0f%%），请以此为目标\n\n",
-				availableMarginPct, actualAvailableBalance, recommendedSingleTradeMargin, ctx.SingleTradeMarginRatio*100))
-		} else if ctx.Account.MarginUsedPct < 85 {
-			sb.WriteString(fmt.Sprintf("⚠️ **保证金警告**: 当前已使用%.1f%%，接近上限！可用余额%.2f USDT | 单笔标准保证金=%.0f USDT（账户净值的%.0f%%），请谨慎是否开新仓\n\n",
-				ctx.Account.MarginUsedPct, actualAvailableBalance, recommendedSingleTradeMargin, ctx.SingleTradeMarginRatio*100))
-		} else {
-			sb.WriteString(fmt.Sprintf("🚨 **保证金警报**: 当前已使用%.1f%%，接近90%%上限！可用余额%.2f USDT | 单笔标准保证金=%.0f USDT（%.0f%%），强烈建议暂停新开仓\n\n",
-				ctx.Account.MarginUsedPct, actualAvailableBalance, recommendedSingleTradeMargin, ctx.SingleTradeMarginRatio*100))
-		}
-	}
+	// 显示保证金基本信息
+	sb.WriteString(fmt.Sprintf("**保证金信息**: 可用余额%.2f USDT | 单笔标准保证金=%.0f USDT（账户净值的%.0f%%）\n\n",
+		actualAvailableBalance, recommendedSingleTradeMargin, ctx.SingleTradeMarginRatio*100))
 
-	// 额外提醒：单笔保证金不能超过可用余额（关键约束）
+	// 保证金约束说明
 	if actualAvailableBalance > 0 {
-		sb.WriteString("🚨 **保证金硬约束（必须严格遵守）**:\n")
+		sb.WriteString("**保证金约束**:\n")
 		sb.WriteString(fmt.Sprintf("   单笔保证金 = position_size_usd / leverage ≤ min(%.2f USDT（标准额度）, %.2f USDT（可用余额）)\n",
 			recommendedSingleTradeMargin, actualAvailableBalance))
 		sb.WriteString(fmt.Sprintf("   最大仓位大小 ≤ min(%.2f × leverage, %.2f × leverage)\n",
 			recommendedSingleTradeMargin, actualAvailableBalance))
-
-		// 显示不同杠杆下的最大仓位
-		if actualAvailableBalance < recommendedSingleTradeMargin {
-			sb.WriteString(fmt.Sprintf("   ⚠️ 资金不足：可用余额%.2f < 建议保证金%.0f USDT\n", actualAvailableBalance, recommendedSingleTradeMargin))
-		}
 
 		// BTC/ETH 的最大仓位
 		if ctx.BTCETHLeverage > 0 {
@@ -544,16 +869,10 @@ func buildUserPrompt(ctx *Context) string {
 			sb.WriteString(fmt.Sprintf("   山寨币（%dx杠杆）最大仓位 = %.2f × %d = %.2f USDT\n", ctx.AltcoinLeverage, actualAvailableBalance, ctx.AltcoinLeverage, maxAltcoinPosition))
 		}
 
-		sb.WriteString("   🚨 超过此限制的决策将被系统拒绝！请务必在计算仓位时检查此约束！\n\n")
-	}
-
-	// 多周期支撑阻力摘要
-	confluenceSummary := buildSupportResistanceDigest(ctx)
-	if confluenceSummary != "" {
-		sb.WriteString("## 多周期关键支撑/阻力\n\n")
-		sb.WriteString(confluenceSummary)
 		sb.WriteString("\n")
 	}
+
+	// K线数据已包含在市场数据中，AI可以自己分析支撑阻力位
 
 	sb.WriteString("⚠️ 手续费提醒：开仓和平仓各收0.0432%，往返约0.0864%；净收益需扣除该成本后再评估。\n\n")
 
@@ -580,9 +899,9 @@ func buildUserPrompt(ctx *Context) string {
 				pos.EntryPrice, pos.MarkPrice, pos.UnrealizedPnLPct,
 				pos.Leverage, pos.MarginUsed, pos.LiquidationPrice, holdingDuration))
 
-			// 使用FormatMarketData输出完整市场数据
+			// 使用FormatMarketData输出完整市场数据（持仓币种显示更多数据）
 			if marketData, ok := ctx.MarketDataMap[pos.Symbol]; ok {
-				sb.WriteString(market.Format(marketData))
+				sb.WriteString(market.Format(marketData, true)) // true表示是持仓币种
 				sb.WriteString("\n")
 			}
 		}
@@ -616,9 +935,9 @@ func buildUserPrompt(ctx *Context) string {
 			}
 		}
 
-		// 使用FormatMarketData输出完整市场数据
+		// 使用FormatMarketData输出完整市场数据（候选币种显示精简数据以节省tokens）
 		sb.WriteString(fmt.Sprintf("### %d. %s%s\n\n", displayedCount, coin.Symbol, sourceTags))
-		sb.WriteString(market.Format(marketData))
+		sb.WriteString(market.Format(marketData, false)) // false表示是候选币种
 		sb.WriteString("\n")
 	}
 	sb.WriteString("\n")
@@ -790,6 +1109,14 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 			return fmt.Errorf("仓位大小必须大于0: %.2f", d.PositionSizeUSD)
 		}
 
+		// 验证持仓观察时间（开仓时必填）
+		if d.ObservationTimeMin <= 0 {
+			return fmt.Errorf("开仓时必须提供observation_time_min（持仓观察时间，分钟），至少30分钟")
+		}
+		if d.ObservationTimeMin < 30 {
+			return fmt.Errorf("持仓观察时间至少30分钟，当前: %d分钟", d.ObservationTimeMin)
+		}
+
 		// 验证保证金不超过可用余额（关键约束）
 		requiredMargin := d.PositionSizeUSD / float64(d.Leverage)
 		// if singleTradeMarginRatio > 0 {
@@ -869,61 +1196,56 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 	return nil
 }
 
-func buildSupportResistanceDigest(ctx *Context) string {
-	seen := make(map[string]bool)
-	symbols := make([]string, 0)
+// deduplicateAndResolveConflicts 去重和解决冲突：同一币种只保留第一个决策
+func deduplicateAndResolveConflicts(decisions []Decision) []Decision {
+	seenSymbols := make(map[string]bool)
+	result := make([]Decision, 0)
 
-	addSymbol := func(symbol string) {
-		symbol = strings.ToUpper(symbol)
-		if !seen[symbol] {
-			seen[symbol] = true
-			symbols = append(symbols, symbol)
-		}
-	}
-
-	for _, pos := range ctx.Positions {
-		addSymbol(pos.Symbol)
-	}
-
-	for _, coin := range ctx.CandidateCoins {
-		addSymbol(coin.Symbol)
-	}
-
-	ordered := make([]string, 0, len(symbols))
-	if seen["BTCUSDT"] {
-		ordered = append(ordered, "BTCUSDT")
-	}
-	for _, symbol := range symbols {
-		if symbol == "BTCUSDT" {
-			continue
-		}
-		ordered = append(ordered, symbol)
-	}
-
-	var sb strings.Builder
-	for _, symbol := range ordered {
-		data, exists := ctx.MarketDataMap[symbol]
-		if !exists || data == nil || data.SupportResistance == nil || data.SupportResistance.Confluence == nil {
+	for _, decision := range decisions {
+		// 对于 wait 和 hold 操作，不需要去重（可以重复）
+		if decision.Action == "wait" || decision.Action == "hold" {
+			result = append(result, decision)
 			continue
 		}
 
-		con := data.SupportResistance.Confluence
-		if len(con.Supports) == 0 && len(con.Resistances) == 0 {
-			continue
+		// 对于其他操作（开仓、平仓），每个币种只保留第一个决策
+		if !seenSymbols[decision.Symbol] {
+			seenSymbols[decision.Symbol] = true
+			result = append(result, decision)
+		} else {
+			log.Printf("⚠️ 检测到重复决策，已忽略：%s %s（已存在该币种的其他决策）", decision.Symbol, decision.Action)
 		}
-
-		sb.WriteString(fmt.Sprintf("- %s: ", symbol))
-		if len(con.Supports) > 0 {
-			sb.WriteString(fmt.Sprintf("支撑 %s", summarizeConfluenceLevels(con.Supports, 2)))
-		}
-		if len(con.Resistances) > 0 {
-			if len(con.Supports) > 0 {
-				sb.WriteString("；")
-			}
-			sb.WriteString(fmt.Sprintf("阻力 %s", summarizeConfluenceLevels(con.Resistances, 2)))
-		}
-		sb.WriteString("\n")
 	}
 
-	return sb.String()
+	return result
 }
+
+// validateFinalDecisions 验证最终汇总的决策（检查总持仓数、总保证金等全局限制）
+func validateFinalDecisions(decisions []Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int, availableBalance float64, maxPositionCount int, singleTradeMarginRatio float64) error {
+	// 统计新开仓数量
+	newOpenPositions := 0
+	totalRequiredMargin := 0.0
+
+	for _, decision := range decisions {
+		if decision.Action == "open_long" || decision.Action == "open_short" {
+			newOpenPositions++
+			requiredMargin := decision.PositionSizeUSD / float64(decision.Leverage)
+			totalRequiredMargin += requiredMargin
+		}
+	}
+
+	// 检查总持仓数限制
+	if newOpenPositions > maxPositionCount {
+		return fmt.Errorf("新开仓数量 %d 超过限制 %d", newOpenPositions, maxPositionCount)
+	}
+
+	// 检查总保证金是否超过可用余额（允许一定的累积）
+	if totalRequiredMargin > availableBalance*1.1 { // 允许10%的容差（考虑订单执行时的价格波动）
+		return fmt.Errorf("总所需保证金 %.2f USDT 超过可用余额 %.2f USDT（含10%%容差）", totalRequiredMargin, availableBalance)
+	}
+
+	return nil
+}
+
+// buildSupportResistanceDigest 已移除，不再提供支撑阻力位摘要
+// 现在AI需要根据K线数据自己分析支撑阻力位

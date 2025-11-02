@@ -551,6 +551,7 @@ func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
 		Exchange:               at.exchange,                      // 交易所类型
 		MaxPositionCount:       at.config.MaxPositionCount,       // 最多持仓币种数量
 		SingleTradeMarginRatio: at.config.SingleTradeMarginRatio, // 单笔开仓保证金比例
+		DecisionLogger:         at.decisionLogger,                // 决策日志记录器，用于获取历史思维链
 	}
 
 	return ctx, nil
