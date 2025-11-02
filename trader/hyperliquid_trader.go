@@ -210,20 +210,38 @@ func (t *HyperliquidTrader) OpenLong(symbol string, quantity float64, leverage i
 	// Hyperliquid symbol格式
 	coin := convertSymbolToHyperliquid(symbol)
 
-	// 获取当前价格（用于市价单）
-	price, err := t.GetMarketPrice(symbol)
-	if err != nil {
-		return nil, err
-	}
-
 	// ⚠️ 关键：根据币种精度要求，四舍五入数量
 	roundedQuantity := t.roundToSzDecimals(coin, quantity)
 	log.Printf("  📏 数量精度处理: %.8f -> %.8f (szDecimals=%d)", quantity, roundedQuantity, t.getSzDecimals(coin))
 
-	// ⚠️ 关键：计算动态价格缓冲（默认0.5%，根据市场情况可调整至0.75%）
-	priceBuffer := t.calculatePriceBuffer(symbol, price, true)
-	aggressivePrice := t.roundPriceToSigfigs(price * (1.0 + priceBuffer))
-	log.Printf("  💰 价格精度处理: %.8f -> %.8f (缓冲%.2f%%, 5位有效数字)", price, aggressivePrice, priceBuffer*100)
+	// ⚠️ 关键：获取订单簿价格，使用最佳卖价作为开多仓的参考
+	orderBook, err := t.GetOrderBookPrice(symbol)
+	if err != nil {
+		return nil, fmt.Errorf("获取订单簿价格失败: %w", err)
+	}
+
+	// 开多仓：使用最佳卖价（BestAsk），并加上小缓冲确保成交
+	// 缓冲基于价差动态调整：价差越小，缓冲越小（市场深度越好）
+	baseBuffer := 0.001 // 基础缓冲0.1%
+	if orderBook.Spread < 0.01 {
+		// 价差极小（<0.01%），主流币种如BTC/ETH/SOL，市场深度极好，使用极小缓冲
+		baseBuffer = 0.0001 // 0.01%（仅确保能立即成交）
+	} else if orderBook.Spread < 0.05 {
+		// 价差很小（0.01-0.05%），市场深度很好，使用很小缓冲
+		baseBuffer = 0.0003 // 0.03%
+	} else if orderBook.Spread < 0.1 {
+		// 价差较小（0.05-0.1%），市场深度好，使用较小缓冲
+		baseBuffer = 0.0008 // 0.08%
+	} else if orderBook.Spread > 0.5 {
+		// 价差较大（>0.5%），市场深度较差，使用较大缓冲确保成交
+		baseBuffer = 0.002 // 0.2%
+	}
+
+	aggressivePrice := orderBook.BestAsk * (1.0 + baseBuffer)
+	aggressivePrice = t.roundPriceToSigfigs(aggressivePrice)
+	log.Printf("  💰 订单簿价格: 买一=%.4f, 卖一=%.4f, 价差=%.4f%%",
+		orderBook.BestBid, orderBook.BestAsk, orderBook.Spread)
+	log.Printf("  💰 下单价格: %.8f (基于卖一价+%.2f%%缓冲, 5位有效数字)", aggressivePrice, baseBuffer*100)
 
 	// 创建市价买入订单（使用IOC limit order with aggressive price）
 	order := hyperliquid.CreateOrderRequest{
@@ -269,20 +287,38 @@ func (t *HyperliquidTrader) OpenShort(symbol string, quantity float64, leverage 
 	// Hyperliquid symbol格式
 	coin := convertSymbolToHyperliquid(symbol)
 
-	// 获取当前价格
-	price, err := t.GetMarketPrice(symbol)
-	if err != nil {
-		return nil, err
-	}
-
 	// ⚠️ 关键：根据币种精度要求，四舍五入数量
 	roundedQuantity := t.roundToSzDecimals(coin, quantity)
 	log.Printf("  📏 数量精度处理: %.8f -> %.8f (szDecimals=%d)", quantity, roundedQuantity, t.getSzDecimals(coin))
 
-	// ⚠️ 关键：计算动态价格缓冲（默认0.5%，根据市场情况可调整至0.75%）
-	priceBuffer := t.calculatePriceBuffer(symbol, price, false)
-	aggressivePrice := t.roundPriceToSigfigs(price * (1.0 - priceBuffer))
-	log.Printf("  💰 价格精度处理: %.8f -> %.8f (缓冲%.2f%%, 5位有效数字)", price, aggressivePrice, priceBuffer*100)
+	// ⚠️ 关键：获取订单簿价格，使用最佳买价作为开空仓的参考
+	orderBook, err := t.GetOrderBookPrice(symbol)
+	if err != nil {
+		return nil, fmt.Errorf("获取订单簿价格失败: %w", err)
+	}
+
+	// 开空仓：使用最佳买价（BestBid），并减去小缓冲确保成交
+	// 缓冲基于价差动态调整：价差越小，缓冲越小（市场深度越好）
+	baseBuffer := 0.001 // 基础缓冲0.1%
+	if orderBook.Spread < 0.01 {
+		// 价差极小（<0.01%），主流币种如BTC/ETH/SOL，市场深度极好，使用极小缓冲
+		baseBuffer = 0.0001 // 0.01%（仅确保能立即成交）
+	} else if orderBook.Spread < 0.05 {
+		// 价差很小（0.01-0.05%），市场深度很好，使用很小缓冲
+		baseBuffer = 0.0003 // 0.03%
+	} else if orderBook.Spread < 0.1 {
+		// 价差较小（0.05-0.1%），市场深度好，使用较小缓冲
+		baseBuffer = 0.0008 // 0.08%
+	} else if orderBook.Spread > 0.5 {
+		// 价差较大（>0.5%），市场深度较差，使用较大缓冲确保成交
+		baseBuffer = 0.002 // 0.2%
+	}
+
+	aggressivePrice := orderBook.BestBid * (1.0 - baseBuffer)
+	aggressivePrice = t.roundPriceToSigfigs(aggressivePrice)
+	log.Printf("  💰 订单簿价格: 买一=%.4f, 卖一=%.4f, 价差=%.4f%%",
+		orderBook.BestBid, orderBook.BestAsk, orderBook.Spread)
+	log.Printf("  💰 下单价格: %.8f (基于买一价-%.2f%%缓冲, 5位有效数字)", aggressivePrice, baseBuffer*100)
 
 	// 创建市价卖出订单
 	order := hyperliquid.CreateOrderRequest{
@@ -337,25 +373,28 @@ func (t *HyperliquidTrader) CloseLong(symbol string, quantity float64) (map[stri
 	// Hyperliquid symbol格式
 	coin := convertSymbolToHyperliquid(symbol)
 
-	// 获取当前价格
-	price, err := t.GetMarketPrice(symbol)
-	if err != nil {
-		return nil, err
-	}
-
 	// ⚠️ 关键：根据币种精度要求，四舍五入数量
 	roundedQuantity := t.roundToSzDecimals(coin, quantity)
 	log.Printf("  📏 数量精度处理: %.8f -> %.8f (szDecimals=%d)", quantity, roundedQuantity, t.getSzDecimals(coin))
 
-	// ⚠️ 关键：计算动态价格缓冲（平仓时使用较小缓冲0.3%，确保快速成交）
-	priceBuffer := t.calculatePriceBuffer(symbol, price, false)
-	// 平仓时使用更小的缓冲，确保尽快成交
-	closeBuffer := priceBuffer * 0.6 // 平仓缓冲约为开仓缓冲的60%
-	if closeBuffer < 0.003 {
-		closeBuffer = 0.003 // 最小0.3%
+	// ⚠️ 关键：获取订单簿价格，平多仓时使用最佳买价（尽量以更好的价格卖出）
+	orderBook, err := t.GetOrderBookPrice(symbol)
+	if err != nil {
+		return nil, fmt.Errorf("获取订单簿价格失败: %w", err)
 	}
-	aggressivePrice := t.roundPriceToSigfigs(price * (1.0 - closeBuffer))
-	log.Printf("  💰 价格精度处理: %.8f -> %.8f (平仓缓冲%.2f%%, 5位有效数字)", price, aggressivePrice, closeBuffer*100)
+
+	// 平多仓：使用最佳买价（BestBid），减去最小缓冲确保快速成交
+	// 平仓时优先考虑速度，使用较小的缓冲
+	closeBuffer := 0.0005 // 平仓缓冲0.05%（更小，确保快速成交）
+	if orderBook.Spread > 1.0 {
+		closeBuffer = 0.001 // 价差很大时，稍微增加缓冲（0.1%）
+	}
+
+	aggressivePrice := orderBook.BestBid * (1.0 - closeBuffer)
+	aggressivePrice = t.roundPriceToSigfigs(aggressivePrice)
+	log.Printf("  💰 订单簿价格: 买一=%.4f, 卖一=%.4f, 价差=%.4f%%",
+		orderBook.BestBid, orderBook.BestAsk, orderBook.Spread)
+	log.Printf("  💰 平仓价格: %.8f (基于买一价-%.2f%%缓冲, 5位有效数字)", aggressivePrice, closeBuffer*100)
 
 	// 创建平仓订单（卖出 + ReduceOnly）
 	order := hyperliquid.CreateOrderRequest{
@@ -415,25 +454,28 @@ func (t *HyperliquidTrader) CloseShort(symbol string, quantity float64) (map[str
 	// Hyperliquid symbol格式
 	coin := convertSymbolToHyperliquid(symbol)
 
-	// 获取当前价格
-	price, err := t.GetMarketPrice(symbol)
-	if err != nil {
-		return nil, err
-	}
-
 	// ⚠️ 关键：根据币种精度要求，四舍五入数量
 	roundedQuantity := t.roundToSzDecimals(coin, quantity)
 	log.Printf("  📏 数量精度处理: %.8f -> %.8f (szDecimals=%d)", quantity, roundedQuantity, t.getSzDecimals(coin))
 
-	// ⚠️ 关键：计算动态价格缓冲（平仓时使用较小缓冲0.3%，确保快速成交）
-	priceBuffer := t.calculatePriceBuffer(symbol, price, true)
-	// 平仓时使用更小的缓冲，确保尽快成交
-	closeBuffer := priceBuffer * 0.6 // 平仓缓冲约为开仓缓冲的60%
-	if closeBuffer < 0.003 {
-		closeBuffer = 0.003 // 最小0.3%
+	// ⚠️ 关键：获取订单簿价格，平空仓时使用最佳卖价（尽量以更好的价格买入）
+	orderBook, err := t.GetOrderBookPrice(symbol)
+	if err != nil {
+		return nil, fmt.Errorf("获取订单簿价格失败: %w", err)
 	}
-	aggressivePrice := t.roundPriceToSigfigs(price * (1.0 + closeBuffer))
-	log.Printf("  💰 价格精度处理: %.8f -> %.8f (平仓缓冲%.2f%%, 5位有效数字)", price, aggressivePrice, closeBuffer*100)
+
+	// 平空仓：使用最佳卖价（BestAsk），加上最小缓冲确保快速成交
+	// 平仓时优先考虑速度，使用较小的缓冲
+	closeBuffer := 0.0005 // 平仓缓冲0.05%（更小，确保快速成交）
+	if orderBook.Spread > 1.0 {
+		closeBuffer = 0.001 // 价差很大时，稍微增加缓冲（0.1%）
+	}
+
+	aggressivePrice := orderBook.BestAsk * (1.0 + closeBuffer)
+	aggressivePrice = t.roundPriceToSigfigs(aggressivePrice)
+	log.Printf("  💰 订单簿价格: 买一=%.4f, 卖一=%.4f, 价差=%.4f%%",
+		orderBook.BestBid, orderBook.BestAsk, orderBook.Spread)
+	log.Printf("  💰 平仓价格: %.8f (基于卖一价+%.2f%%缓冲, 5位有效数字)", aggressivePrice, closeBuffer*100)
 
 	// 创建平仓订单（买入 + ReduceOnly）
 	order := hyperliquid.CreateOrderRequest{
@@ -493,26 +535,143 @@ func (t *HyperliquidTrader) CancelAllOrders(symbol string) error {
 	return nil
 }
 
-// GetMarketPrice 获取市场价格
-func (t *HyperliquidTrader) GetMarketPrice(symbol string) (float64, error) {
+// OrderBookPrice 订单簿价格信息
+type OrderBookPrice struct {
+	BestBid  float64 // 最佳买价
+	BestAsk  float64 // 最佳卖价
+	MidPrice float64 // 中间价 = (BestBid + BestAsk) / 2
+	Spread   float64 // 价差百分比 = (BestAsk - BestBid) / MidPrice * 100
+}
+
+// GetOrderBookPrice 获取订单簿价格（最佳买卖价）
+// 优先尝试从API获取真实订单簿，如果失败则使用估算方法
+func (t *HyperliquidTrader) GetOrderBookPrice(symbol string) (*OrderBookPrice, error) {
 	coin := convertSymbolToHyperliquid(symbol)
 
-	// 获取所有市场价格
+	// 方法1：尝试通过 HTTP API 获取订单簿（l2Book）
+	orderBook, err := t.getOrderBookFromAPI(coin)
+	if err == nil && orderBook != nil {
+		log.Printf("  📊 从API获取订单簿: 买一=%.4f, 卖一=%.4f, 价差=%.4f%%",
+			orderBook.BestBid, orderBook.BestAsk, orderBook.Spread)
+		return orderBook, nil
+	}
+
+	// 方法2：回退到使用 allMids 估算买卖价
+	log.Printf("  ⚠️ 无法从API获取订单簿，使用估算方法: %v", err)
+	return t.estimateOrderBookFromMidPrice(coin)
+}
+
+// getOrderBookFromAPI 从 Hyperliquid API 获取订单簿数据
+func (t *HyperliquidTrader) getOrderBookFromAPI(coin string) (*OrderBookPrice, error) {
+	// 使用 Hyperliquid SDK 的 L2Snapshot 方法获取订单簿快照
+	l2Book, err := t.exchange.Info().L2Snapshot(t.ctx, coin)
+	if err != nil {
+		return nil, fmt.Errorf("获取订单簿快照失败: %w", err)
+	}
+
+	if l2Book == nil {
+		return nil, fmt.Errorf("订单簿数据为空")
+	}
+
+	// L2Book.Levels 是 [][]Level 格式
+	// Levels[0] 通常是 bids（买单），Levels[1] 通常是 asks（卖单）
+	// 每个 Level 包含 Px (价格) 和 Sz (数量)
+	var bestBid, bestAsk float64
+
+	if len(l2Book.Levels) >= 2 {
+		// Levels[0] 是买单列表（bids），按价格从高到低排序
+		if len(l2Book.Levels[0]) > 0 {
+			bestBid = l2Book.Levels[0][0].Px // 第一个是最高买价
+		}
+
+		// Levels[1] 是卖单列表（asks），按价格从低到高排序
+		if len(l2Book.Levels[1]) > 0 {
+			bestAsk = l2Book.Levels[1][0].Px // 第一个是最低卖价
+		}
+	} else if len(l2Book.Levels) == 1 {
+		// 如果只有一个数组，可能是混合的，尝试找到最高买价和最低卖价
+		var bids []float64
+		for _, level := range l2Book.Levels[0] {
+			// 这里需要根据实际情况判断，暂时假设第一个是买价
+			if level.Px > 0 {
+				bids = append(bids, level.Px)
+			}
+		}
+		if len(bids) > 0 {
+			bestBid = bids[0]
+			if len(bids) > 1 {
+				bestAsk = bids[len(bids)-1]
+			}
+		}
+	}
+
+	// 验证数据有效性
+	if bestBid <= 0 || bestAsk <= 0 {
+		return nil, fmt.Errorf("订单簿数据无效: 买一=%.4f, 卖一=%.4f", bestBid, bestAsk)
+	}
+
+	if bestBid >= bestAsk {
+		return nil, fmt.Errorf("订单簿数据异常: 买一(%.4f) >= 卖一(%.4f)", bestBid, bestAsk)
+	}
+
+	midPrice := (bestBid + bestAsk) / 2
+	spread := (bestAsk - bestBid) / midPrice * 100
+
+	return &OrderBookPrice{
+		BestBid:  bestBid,
+		BestAsk:  bestAsk,
+		MidPrice: midPrice,
+		Spread:   spread,
+	}, nil
+}
+
+// estimateOrderBookFromMidPrice 基于中间价估算订单簿价格
+func (t *HyperliquidTrader) estimateOrderBookFromMidPrice(coin string) (*OrderBookPrice, error) {
+	// 获取中间价
 	allMids, err := t.exchange.Info().AllMids(t.ctx)
 	if err != nil {
-		return 0, fmt.Errorf("获取价格失败: %w", err)
+		return nil, fmt.Errorf("获取价格失败: %w", err)
 	}
 
-	// 查找对应币种的价格（allMids是map[string]string）
-	if priceStr, ok := allMids[coin]; ok {
-		priceFloat, err := strconv.ParseFloat(priceStr, 64)
-		if err == nil {
-			return priceFloat, nil
-		}
-		return 0, fmt.Errorf("价格格式错误: %v", err)
+	priceStr, ok := allMids[coin]
+	if !ok {
+		return nil, fmt.Errorf("未找到 %s 的价格", coin)
 	}
 
-	return 0, fmt.Errorf("未找到 %s 的价格", symbol)
+	midPrice, err := strconv.ParseFloat(priceStr, 64)
+	if err != nil {
+		return nil, fmt.Errorf("价格格式错误: %v", err)
+	}
+
+	// 估算价差：根据币种和价格范围动态估算
+	// 对于主流币种（BTC, ETH），价差通常较小（0.01-0.1%）
+	// 对于山寨币，价差可能更大（0.1-0.5%）
+	estimatedSpreadPercent := 0.001 // 默认0.1%
+	if midPrice > 10000 {
+		estimatedSpreadPercent = 0.0005 // 高价币种价差更小（0.05%）
+	} else if midPrice < 1 {
+		estimatedSpreadPercent = 0.002 // 低价币种价差更大（0.2%）
+	}
+
+	spread := midPrice * estimatedSpreadPercent
+	bestBid := midPrice - spread/2
+	bestAsk := midPrice + spread/2
+
+	return &OrderBookPrice{
+		BestBid:  bestBid,
+		BestAsk:  bestAsk,
+		MidPrice: midPrice,
+		Spread:   estimatedSpreadPercent * 100,
+	}, nil
+}
+
+// GetMarketPrice 获取市场价格（兼容性函数，返回中间价）
+func (t *HyperliquidTrader) GetMarketPrice(symbol string) (float64, error) {
+	orderBook, err := t.GetOrderBookPrice(symbol)
+	if err != nil {
+		return 0, err
+	}
+	return orderBook.MidPrice, nil
 }
 
 // SetStopLoss 设置止损单

@@ -17,7 +17,7 @@ import (
 type KlineAnalysisResult struct {
 	Symbol       string    `json:"symbol"`
 	Timestamp    time.Time `json:"timestamp"` // 分析时间
-	CurrentPrice float64   `json:"current_price"`
+	// 注意：不缓存当前价格，因为价格会实时变化
 
 	// 支撑位/阻力位分析
 	SupportLevels    []PriceLevel `json:"support_levels"`    // 支撑位列表
@@ -188,11 +188,12 @@ func LoadAllKlineAnalysisFromFiles() error {
 
 // logKlineAnalysisResult 在日志中输出K线分析结果
 func logKlineAnalysisResult(symbol string, result *KlineAnalysisResult) {
-	log.Printf("\n" + strings.Repeat("=", 70))
+	separator := strings.Repeat("=", 70)
+	log.Printf("\n%s", separator)
 	log.Printf("📊 %s K线分析结果", symbol)
-	log.Printf(strings.Repeat("=", 70))
+	log.Printf("%s", separator)
 	log.Printf("📅 分析时间: %s", result.Timestamp.Format("2006-01-02 15:04:05"))
-	log.Printf("💰 当前价格: %.4f", result.CurrentPrice)
+	// 注意：当前价格不缓存，需从实时数据获取
 
 	// 支撑位
 	if len(result.SupportLevels) > 0 {
@@ -317,7 +318,7 @@ func logKlineAnalysisResult(symbol string, result *KlineAnalysisResult) {
 		log.Printf("   %s", summary)
 	}
 
-	log.Printf(strings.Repeat("=", 70))
+	log.Printf("%s", strings.Repeat("=", 70))
 }
 
 // SetKlineAnalysis 设置K线分析结果（写入缓存）
@@ -891,7 +892,7 @@ func parseKlineAnalysisResult(response, symbol string, currentPrice float64) (*K
 	// 解析JSON
 	var result KlineAnalysisResult
 	result.Symbol = symbol
-	result.CurrentPrice = currentPrice
+	// 不缓存当前价格（currentPrice 参数仅用于过滤无效的斐波那契数据）
 
 	// 使用临时结构解析JSON
 	var jsonData struct {
@@ -1071,7 +1072,7 @@ func parseKlineAnalysisBatchResult(response string, symbols []string, dataMap ma
 
 		result := &KlineAnalysisResult{
 			Symbol:           symbol,
-			CurrentPrice:     data.CurrentPrice,
+			// 不缓存当前价格
 			SupportLevels:    jsonData.SupportLevels,
 			ResistanceLevels: jsonData.ResistanceLevels,
 			Fibonacci15m:     jsonData.Fibonacci15m,
@@ -1137,7 +1138,7 @@ func FormatKlineAnalysis(symbol string, data *Data, isPosition bool) string {
 	}
 
 	sb.WriteString(fmt.Sprintf("📊 %s K线分析结果（分析时间：%s）\n\n", symbol, analysis.Timestamp.Format("2006-01-02 15:04:05")))
-	sb.WriteString(fmt.Sprintf("当前价格：%.4f\n\n", analysis.CurrentPrice))
+	sb.WriteString(fmt.Sprintf("当前价格：%.4f\n\n", data.CurrentPrice))
 
 	// 支撑位
 	if len(analysis.SupportLevels) > 0 {

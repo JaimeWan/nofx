@@ -142,9 +142,9 @@ func TestKlineAnalysisCache(t *testing.T) {
 	// 1. 测试设置和获取缓存
 	symbol := "BTCUSDT"
 	result := &KlineAnalysisResult{
-		Symbol:       symbol,
-		Timestamp:    time.Now(),
-		CurrentPrice: 50000.0,
+		Symbol:    symbol,
+		Timestamp: time.Now(),
+		// 注意：不缓存当前价格
 		SupportLevels: []PriceLevel{
 			{Price: 49000.0, Strength: 4, Timeframe: "4h", Type: "support"},
 		},
@@ -180,9 +180,9 @@ func TestKlineAnalysisCacheExpiry(t *testing.T) {
 	// 创建一个已过期的缓存（直接在缓存中设置，绕过SetKlineAnalysis的时间戳更新）
 	klineAnalysisCacheMu.Lock()
 	expiredResult := &KlineAnalysisResult{
-		Symbol:       symbol,
-		Timestamp:  time.Now().Add(-20 * time.Minute), // 20分钟前（超过15分钟TTL）
-		CurrentPrice: 3000.0,
+		Symbol:    symbol,
+		Timestamp: time.Now().Add(-20 * time.Minute), // 20分钟前（超过15分钟TTL）
+		// 注意：不缓存当前价格
 	}
 	klineAnalysisCache[symbol] = expiredResult
 	klineAnalysisCacheMu.Unlock()
@@ -195,9 +195,9 @@ func TestKlineAnalysisCacheExpiry(t *testing.T) {
 
 	// 设置新的有效缓存
 	result := &KlineAnalysisResult{
-		Symbol:       symbol,
-		Timestamp:    time.Now(), // 使用当前时间
-		CurrentPrice: 3000.0,
+		Symbol:    symbol,
+		Timestamp: time.Now(), // 使用当前时间
+		// 注意：不缓存当前价格
 	}
 	SetKlineAnalysis(symbol, result)
 	cached = GetKlineAnalysis(symbol)
@@ -205,10 +205,7 @@ func TestKlineAnalysisCacheExpiry(t *testing.T) {
 		t.Fatal("❌ 新设置的缓存应该有效，但获取不到")
 	}
 
-	// 验证缓存内容
-	if cached.CurrentPrice != 3000.0 {
-		t.Fatalf("❌ 缓存价格不匹配: 期望 3000.0, 实际 %.2f", cached.CurrentPrice)
-	}
+	// 验证缓存内容（不再验证价格，因为价格不缓存）
 
 	t.Logf("✅ 缓存过期机制测试通过")
 }
@@ -235,9 +232,7 @@ func TestParseKlineAnalysisResult(t *testing.T) {
 		t.Fatalf("❌ 符号不匹配: 期望 %s, 实际 %s", symbol, result.Symbol)
 	}
 
-	if result.CurrentPrice != currentPrice {
-		t.Fatalf("❌ 当前价格不匹配: 期望 %.2f, 实际 %.2f", currentPrice, result.CurrentPrice)
-	}
+	// 不再验证当前价格，因为价格不缓存
 
 	if len(result.SupportLevels) == 0 {
 		t.Fatal("❌ 应该包含支撑位")
@@ -359,9 +354,9 @@ func TestFormatKlineAnalysis(t *testing.T) {
 
 	// 设置测试缓存
 	result := &KlineAnalysisResult{
-		Symbol:       symbol,
-		Timestamp:    time.Now(),
-		CurrentPrice: 50000.0,
+		Symbol:    symbol,
+		Timestamp: time.Now(),
+		// 注意：不缓存当前价格
 		SupportLevels: []PriceLevel{
 			{Price: 49000.0, Strength: 4, Timeframe: "4h", Type: "support"},
 			{Price: 48000.0, Strength: 3, Timeframe: "1h", Type: "support"},
@@ -430,9 +425,9 @@ func TestCacheSkipsAnalysis(t *testing.T) {
 
 	// 设置有效缓存
 	result := &KlineAnalysisResult{
-		Symbol:       symbol,
-		Timestamp:    time.Now(),
-		CurrentPrice: 50000.0,
+		Symbol:    symbol,
+		Timestamp: time.Now(),
+		// 注意：不缓存当前价格
 		AnalysisSummary: "已缓存的分析",
 	}
 	SetKlineAnalysis(symbol, result)
@@ -461,9 +456,9 @@ func contains(s, substr string) bool {
 func BenchmarkKlineAnalysisCache(b *testing.B) {
 	symbol := "BTCUSDT"
 	result := &KlineAnalysisResult{
-		Symbol:       symbol,
-		Timestamp:    time.Now(),
-		CurrentPrice: 50000.0,
+		Symbol:    symbol,
+		Timestamp: time.Now(),
+		// 注意：不缓存当前价格
 		AnalysisSummary: "基准测试",
 	}
 

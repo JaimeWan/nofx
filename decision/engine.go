@@ -1104,6 +1104,35 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 			return fmt.Errorf("风险评估异常：止损距离过近或数据无效（风险%.4f%%）", effectiveRiskPercent)
 		}
 
+		// 验证风险回报比必须≥1:3（严格强制执行）
+		rewardRiskRatio := netRewardPercent / effectiveRiskPercent
+		if rewardRiskRatio < 3.0 {
+			return fmt.Errorf("风险回报比不达标：当前%.2f:1，必须≥3:1（风险%.2f%%，收益%.2f%%）", 
+				rewardRiskRatio, effectiveRiskPercent, netRewardPercent)
+		}
+
+		// 同时验证价格差异的风险回报比（基于止损止盈价格设置）
+		var priceRisk, priceReward float64
+		if d.Action == "open_long" {
+			// 做多：风险 = 入场价 - 止损价，收益 = 止盈价 - 入场价
+			priceRisk = entryPrice - d.StopLoss
+			priceReward = d.TakeProfit - entryPrice
+		} else {
+			// 做空：风险 = 止损价 - 入场价，收益 = 入场价 - 止盈价
+			priceRisk = d.StopLoss - entryPrice
+			priceReward = entryPrice - d.TakeProfit
+		}
+
+		if priceRisk <= 0 || priceReward <= 0 {
+			return fmt.Errorf("止损止盈价格设置异常：风险%.4f，收益%.4f", priceRisk, priceReward)
+		}
+
+		priceRewardRiskRatio := priceReward / priceRisk
+		if priceRewardRiskRatio < 3.0 {
+			return fmt.Errorf("止盈止损价格比不达标：当前%.2f:1（收益价格%.4f:风险价格%.4f），必须≥3:1。请调整止损价或止盈价以满足要求", 
+				priceRewardRiskRatio, priceReward, priceRisk)
+		}
+
 	}
 
 	return nil
