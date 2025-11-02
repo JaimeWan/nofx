@@ -86,6 +86,11 @@ func (cfg *Client) SetClient(Client Client) {
 
 // CallWithMessages 使用 system + user prompt 调用AI API（推荐）
 func (cfg *Client) CallWithMessages(systemPrompt, userPrompt string) (string, error) {
+	return cfg.CallWithMessagesWithMaxTokens(systemPrompt, userPrompt, 2000)
+}
+
+// CallWithMessagesWithMaxTokens 使用 system + user prompt 调用AI API，可指定max_tokens
+func (cfg *Client) CallWithMessagesWithMaxTokens(systemPrompt, userPrompt string, maxTokens int) (string, error) {
 	if cfg.APIKey == "" {
 		return "", fmt.Errorf("AI API密钥未设置，请先调用 SetDeepSeekAPIKey() 或 SetQwenAPIKey()")
 	}
@@ -99,7 +104,7 @@ func (cfg *Client) CallWithMessages(systemPrompt, userPrompt string) (string, er
 			fmt.Printf("⚠️  AI API调用失败，正在重试 (%d/%d)...\n", attempt, maxRetries)
 		}
 
-		result, err := cfg.callOnce(systemPrompt, userPrompt)
+		result, err := cfg.callOnceWithMaxTokens(systemPrompt, userPrompt, maxTokens)
 		if err == nil {
 			if attempt > 1 {
 				fmt.Printf("✓ AI API重试成功\n")
@@ -124,8 +129,13 @@ func (cfg *Client) CallWithMessages(systemPrompt, userPrompt string) (string, er
 	return "", fmt.Errorf("重试%d次后仍然失败: %w", maxRetries, lastErr)
 }
 
-// callOnce 单次调用AI API（内部使用）
+// callOnce 单次调用AI API（内部使用，向后兼容，默认max_tokens=2000）
 func (cfg *Client) callOnce(systemPrompt, userPrompt string) (string, error) {
+	return cfg.callOnceWithMaxTokens(systemPrompt, userPrompt, 2000)
+}
+
+// callOnceWithMaxTokens 单次调用AI API（内部使用，可指定max_tokens）
+func (cfg *Client) callOnceWithMaxTokens(systemPrompt, userPrompt string, maxTokens int) (string, error) {
 	// 构建 messages 数组
 	messages := []map[string]string{}
 
@@ -148,7 +158,7 @@ func (cfg *Client) callOnce(systemPrompt, userPrompt string) (string, error) {
 		"model":       cfg.Model,
 		"messages":    messages,
 		"temperature": 0.5, // 降低temperature以提高JSON格式稳定性
-		"max_tokens":  2000,
+		"max_tokens":  maxTokens,
 	}
 
 	// 注意：response_format 参数仅 OpenAI 支持，DeepSeek/Qwen 不支持

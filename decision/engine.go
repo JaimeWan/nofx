@@ -101,8 +101,8 @@ type FullDecision struct {
 	Timestamp  time.Time  `json:"timestamp"`
 }
 
-// GetFullDecision 获取AI的完整交易决策（批量分析所有币种和持仓）
-// 采用分批处理策略，避免token超限，同时提供更详细的数据给LLM
+// GetFullDecision 获取AI的完整交易决策（一次性分析所有币种和持仓）
+// 由于使用了K线分析缓存，token消耗已大大减少，可以一次性发送所有币种信息
 func GetFullDecision(ctx *Context, mcpClient *mcp.Client) (*FullDecision, error) {
 	// 1. 为所有币种获取市场数据
 	if err := fetchMarketDataForContext(ctx); err != nil {
@@ -112,143 +112,56 @@ func GetFullDecision(ctx *Context, mcpClient *mcp.Client) (*FullDecision, error)
 	// 2. 构建 System Prompt（固定规则）
 	systemPrompt := buildSystemPrompt(ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage, ctx.MaxPositionCount, ctx.SingleTradeMarginRatio)
 
-	// 3. 分批处理：将币种分组，每次只分析一部分
-	const batchSize = 2 // 每批处理的候选币种数量（持仓币种单独处理或合并处理）
+	// 3. 构建 User Prompt（包含所有持仓和候选币种）
+	userPrompt := buildUserPrompt(ctx)
 
-	// 准备持仓币种列表
-	positionSymbols := make([]string, 0, len(ctx.Positions))
-	for _, pos := range ctx.Positions {
-		positionSymbols = append(positionSymbols, pos.Symbol)
+	// 4. 调用AI API获取决策
+	log.Printf("📊 分析 %d 个持仓币种 + %d 个候选币种（一次性处理）", len(ctx.Positions), len(ctx.CandidateCoins))
+	aiResponse, err := mcpClient.CallWithMessages(systemPrompt, userPrompt)
+	if err != nil {
+		return nil, fmt.Errorf("调用AI API失败: %w", err)
 	}
 
-	// 准备候选币种列表（只包含有市场数据的）
-	candidateSymbols := make([]string, 0)
-	candidateCoinMap := make(map[string]CandidateCoin) // symbol -> CandidateCoin
-	for _, coin := range ctx.CandidateCoins {
-		if _, hasData := ctx.MarketDataMap[coin.Symbol]; hasData {
-			candidateSymbols = append(candidateSymbols, coin.Symbol)
-			candidateCoinMap[coin.Symbol] = coin
-		}
+	// 5. 解析AI响应
+	fullDecision, err := parseFullDecisionResponse(aiResponse, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage, ctx.Account.AvailableBalance, ctx.SingleTradeMarginRatio)
+	if err != nil {
+		return nil, fmt.Errorf("解析AI决策失败: %w", err)
 	}
 
-	// 4. 分批调用AI API并汇总结果
-	allDecisions := make([]Decision, 0)
-	allCoTTraces := make([]string, 0)
-	var fullUserPrompt strings.Builder // 用于记录完整的user prompt
-
-	// 如果持仓币种较少（<=3个），可以与第一批候选币种合并处理
-	// 否则持仓币种单独一批处理
-	positionBatchHandled := false
-	if len(positionSymbols) > 0 && len(positionSymbols) <= 3 && len(candidateSymbols) > 0 {
-		// 持仓币种与第一批候选币种合并
-		firstBatchCandidates := candidateSymbols
-		if len(firstBatchCandidates) > batchSize {
-			firstBatchCandidates = firstBatchCandidates[:batchSize]
-		}
-
-		userPrompt := buildUserPromptBatch(ctx, positionSymbols, firstBatchCandidates, candidateCoinMap, len(candidateSymbols), 1)
-		fullUserPrompt.WriteString("=== 批次 1 (持仓 + 候选币种) ===\n")
-		fullUserPrompt.WriteString(userPrompt)
-		fullUserPrompt.WriteString("\n\n")
-
-		log.Printf("📊 批次 1: 分析 %d 个持仓币种 + %d 个候选币种", len(positionSymbols), len(firstBatchCandidates))
-		aiResponse, err := mcpClient.CallWithMessages(systemPrompt, userPrompt)
-		if err != nil {
-			return nil, fmt.Errorf("批次1调用AI API失败: %w", err)
-		}
-
-		decision, err := parseFullDecisionResponse(aiResponse, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage, ctx.Account.AvailableBalance, ctx.SingleTradeMarginRatio)
-		if err != nil {
-			log.Printf("⚠️ 批次1解析失败: %v", err)
-		} else {
-			allDecisions = append(allDecisions, decision.Decisions...)
-			if decision.CoTTrace != "" {
-				allCoTTraces = append(allCoTTraces, fmt.Sprintf("=== 批次1思维链 ===\n%s", decision.CoTTrace))
-			}
-		}
-
-		positionBatchHandled = true
-		candidateSymbols = candidateSymbols[len(firstBatchCandidates):]
+	// 6. 验证决策
+	if err := validateDecisions(fullDecision.Decisions, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage, ctx.Account.AvailableBalance, ctx.SingleTradeMarginRatio); err != nil {
+		log.Printf("⚠️ 决策验证失败: %v，将返回部分决策", err)
+		// 不直接返回错误，而是记录日志并继续
 	}
 
-	// 处理剩余的持仓币种（如果之前没有合并处理）
-	if len(positionSymbols) > 0 && !positionBatchHandled {
-		userPrompt := buildUserPromptBatch(ctx, positionSymbols, nil, candidateCoinMap, len(candidateSymbols), 0)
-		fullUserPrompt.WriteString("=== 批次 1 (持仓币种) ===\n")
-		fullUserPrompt.WriteString(userPrompt)
-		fullUserPrompt.WriteString("\n\n")
-
-		log.Printf("📊 批次 1: 分析 %d 个持仓币种", len(positionSymbols))
-		aiResponse, err := mcpClient.CallWithMessages(systemPrompt, userPrompt)
-		if err != nil {
-			return nil, fmt.Errorf("批次1(持仓)调用AI API失败: %w", err)
-		}
-
-		decision, err := parseFullDecisionResponse(aiResponse, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage, ctx.Account.AvailableBalance, ctx.SingleTradeMarginRatio)
-		if err != nil {
-			log.Printf("⚠️ 批次1(持仓)解析失败: %v", err)
-		} else {
-			allDecisions = append(allDecisions, decision.Decisions...)
-			if decision.CoTTrace != "" {
-				allCoTTraces = append(allCoTTraces, fmt.Sprintf("=== 批次1(持仓)思维链 ===\n%s", decision.CoTTrace))
-			}
+	// 7. 最终验证：检查总持仓数限制、总保证金使用等
+	newOpenPositions := 0
+	totalRequiredMargin := 0.0
+	for _, decision := range fullDecision.Decisions {
+		if decision.Action == "open_long" || decision.Action == "open_short" {
+			newOpenPositions++
+			requiredMargin := decision.PositionSizeUSD / float64(decision.Leverage)
+			totalRequiredMargin += requiredMargin
 		}
 	}
 
-	// 分批处理候选币种
-	batchNum := 2
-	for i := 0; i < len(candidateSymbols); i += batchSize {
-		end := i + batchSize
-		if end > len(candidateSymbols) {
-			end = len(candidateSymbols)
-		}
-
-		batchCandidates := candidateSymbols[i:end]
-		userPrompt := buildUserPromptBatch(ctx, nil, batchCandidates, candidateCoinMap, len(candidateSymbols), batchNum)
-		fullUserPrompt.WriteString(fmt.Sprintf("=== 批次 %d (候选币种 %d-%d) ===\n", batchNum, i+1, end))
-		fullUserPrompt.WriteString(userPrompt)
-		fullUserPrompt.WriteString("\n\n")
-
-		log.Printf("📊 批次 %d: 分析 %d 个候选币种 (%d-%d)", batchNum, len(batchCandidates), i+1, end)
-		aiResponse, err := mcpClient.CallWithMessages(systemPrompt, userPrompt)
-		if err != nil {
-			log.Printf("⚠️ 批次%d调用AI API失败: %v，继续处理下一批", batchNum, err)
-			batchNum++
-			continue
-		}
-
-		decision, err := parseFullDecisionResponse(aiResponse, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage, ctx.Account.AvailableBalance, ctx.SingleTradeMarginRatio)
-		if err != nil {
-			log.Printf("⚠️ 批次%d解析失败: %v", batchNum, err)
-		} else {
-			allDecisions = append(allDecisions, decision.Decisions...)
-			if decision.CoTTrace != "" {
-				allCoTTraces = append(allCoTTraces, fmt.Sprintf("=== 批次%d思维链 ===\n%s", batchNum, decision.CoTTrace))
-			}
-		}
-
-		batchNum++
+	if newOpenPositions > ctx.MaxPositionCount {
+		log.Printf("⚠️ 新开仓数量 %d 超过限制 %d", newOpenPositions, ctx.MaxPositionCount)
 	}
 
-	// 5. 汇总和清理所有批次的决策
-	// 5.1 去重和冲突处理：同一币种只保留第一个决策（后续批次的决策如果冲突会被忽略）
-	finalDecisions := deduplicateAndResolveConflicts(allDecisions)
-
-	// 5.2 最终验证：检查总持仓数限制、总保证金使用等
-	if err := validateFinalDecisions(finalDecisions, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage, ctx.Account.AvailableBalance, ctx.MaxPositionCount, ctx.SingleTradeMarginRatio); err != nil {
-		log.Printf("⚠️ 最终决策验证失败: %v，将返回部分决策", err)
-		// 不直接返回错误，而是记录日志并继续，让上层决定如何处理
+	if totalRequiredMargin > ctx.Account.AvailableBalance*1.1 {
+		log.Printf("⚠️ 总所需保证金 %.2f USDT 超过可用余额 %.2f USDT（含10%%容差）", totalRequiredMargin, ctx.Account.AvailableBalance)
 	}
 
-	// 5.3 构建最终结果
+	// 8. 构建最终结果
 	result := &FullDecision{
-		Decisions:  finalDecisions,
-		CoTTrace:   strings.Join(allCoTTraces, "\n\n"),
+		Decisions:  fullDecision.Decisions,
+		CoTTrace:   fullDecision.CoTTrace,
 		Timestamp:  time.Now(),
-		UserPrompt: fullUserPrompt.String(),
+		UserPrompt: userPrompt,
 	}
 
-	log.Printf("✅ 分批处理完成: 共 %d 个批次，汇总 %d 个决策（去重后 %d 个）", batchNum-1, len(allDecisions), len(finalDecisions))
+	log.Printf("✅ 决策完成: 共 %d 个决策", len(result.Decisions))
 	return result, nil
 }
 

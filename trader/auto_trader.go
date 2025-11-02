@@ -132,6 +132,13 @@ func NewAutoTrader(config AutoTraderConfig) (*AutoTrader, error) {
 		pool.SetCoinPoolAPI(config.CoinPoolAPIURL)
 	}
 
+	// 加载K线分析缓存（从JSON文件）
+	if err := market.LoadAllKlineAnalysisFromFiles(); err != nil {
+		log.Printf("⚠️ 加载K线分析缓存失败: %v", err)
+	} else {
+		log.Printf("✅ K线分析缓存已从文件加载")
+	}
+
 	// 设置默认交易平台
 	if config.Exchange == "" {
 		config.Exchange = "binance"
@@ -198,6 +205,9 @@ func (at *AutoTrader) Run() error {
 
 	ticker := time.NewTicker(at.config.ScanInterval)
 	defer ticker.Stop()
+
+	// 启动K线分析定时任务（每15分钟分析一次）
+	go at.startKlineAnalysisTask()
 
 	// 首次立即执行
 	if err := at.runCycle(); err != nil {
@@ -948,4 +958,102 @@ func sortDecisionsByPriority(decisions []decision.Decision) []decision.Decision 
 	}
 
 	return sorted
+}
+
+// startKlineAnalysisTask 启动K线分析定时任务（每15分钟分析一次所有活跃币种的K线）
+func (at *AutoTrader) startKlineAnalysisTask() {
+	log.Println("🔄 K线分析定时任务已启动（每15分钟分析一次）")
+
+	// 立即执行一次（延迟5秒，等待系统初始化）
+	time.Sleep(5 * time.Second)
+	at.runKlineAnalysisCycle()
+
+	// 每15分钟执行一次
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+
+	for at.isRunning {
+		select {
+		case <-ticker.C:
+			at.runKlineAnalysisCycle()
+		}
+	}
+}
+
+// runKlineAnalysisCycle 执行一次K线分析周期
+func (at *AutoTrader) runKlineAnalysisCycle() {
+	log.Printf("\n" + strings.Repeat("=", 70))
+	log.Println("📊 开始K线分析周期（通过LLM分析并缓存结果）")
+	log.Printf(strings.Repeat("=", 70))
+
+	// 1. 收集所有活跃币种（持仓 + 候选币种）
+	symbols := make(map[string]bool)
+
+	// 收集持仓币种
+	positions, err := at.trader.GetPositions()
+	if err == nil {
+		for _, pos := range positions {
+			if symbol, ok := pos["symbol"].(string); ok {
+				symbols[symbol] = true
+			}
+		}
+	}
+
+	// 收集候选币种（从币种池获取）
+	candidates, err := pool.GetCoinPool()
+	if err == nil {
+		for _, coin := range candidates {
+			// CoinInfo 的 Pair 字段是交易对符号
+			symbols[coin.Pair] = true
+		}
+	}
+
+	log.Printf("📋 需要分析的币种数量: %d", len(symbols))
+
+	// 2. 获取所有币种的市场数据
+	symbolList := make([]string, 0, len(symbols))
+	dataMap := make(map[string]*market.Data)
+
+	for symbol := range symbols {
+		symbol = market.Normalize(symbol)
+		symbolList = append(symbolList, symbol)
+
+		// 获取市场数据
+		data, err := market.Get(symbol, at.config.Exchange)
+		if err != nil {
+			log.Printf("⚠️ 获取 %s 市场数据失败: %v", symbol, err)
+			continue
+		}
+
+		dataMap[symbol] = data
+	}
+
+	// 3. 逐个分析每个币种（每次只处理1个代币）
+	successCount := 0
+	failCount := 0
+	
+	for _, symbol := range symbolList {
+		symbol = market.Normalize(symbol)
+		
+		// 检查数据是否存在
+		data, hasData := dataMap[symbol]
+		if !hasData {
+			log.Printf("⚠️ 跳过 %s（无市场数据）", symbol)
+			continue
+		}
+		
+		// 逐个分析
+		if err := market.AnalyzeKlinesWithLLM(symbol, data, at.mcpClient); err != nil {
+			log.Printf("⚠️ %s 的K线分析失败: %v", symbol, err)
+			failCount++
+		} else {
+			successCount++
+		}
+		
+		// 每个币种分析后短暂延迟，避免API限流
+		time.Sleep(1 * time.Second)
+	}
+
+	log.Printf("✅ K线分析周期完成: 成功 %d 个，失败 %d 个", successCount, failCount)
+	log.Printf(strings.Repeat("=", 70) + "\n")
 }

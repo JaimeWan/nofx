@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"math"
 	"net/http"
 	"strconv"
@@ -153,13 +154,23 @@ func Get(symbol string, exchange string) (*Data, error) {
 		return nil, fmt.Errorf("获取1日K线失败: %v", err)
 	}
 
+	// 获取标记价格（用于LLM决策）
+	markPrice, err := getMarkPrice(symbol, exchange)
+	if err != nil {
+		// 获取标记价格失败时，回退到使用K线收盘价
+		log.Printf("⚠️ 获取%s标记价格失败，使用K线收盘价: %v", symbol, err)
+		markPrice = klines3m[len(klines3m)-1].Close
+	}
+
+	// 使用标记价格作为当前价格（传给LLM决策）
+	currentPrice := markPrice
+
 	// 计算当前指标 (基于3分钟最新数据)
-	currentPrice := klines3m[len(klines3m)-1].Close
 	currentEMA20 := calculateEMA(klines3m, 20)
 	currentMACD := calculateMACD(klines3m)
 	currentRSI7 := calculateRSI(klines3m, 7)
 
-	// 计算价格变化百分比
+	// 计算价格变化百分比（基于标记价格）
 	// 1小时价格变化 = 20个3分钟K线前的价格
 	priceChange1h := 0.0
 	if len(klines3m) >= 21 { // 至少需要21根K线 (当前 + 20根前)
@@ -200,8 +211,8 @@ func Get(symbol string, exchange string) (*Data, error) {
 	// 获取Funding Rate
 	fundingRate, _ := getFundingRate(symbol)
 
-	// 计算日内系列数据
-	intradayData := calculateIntradaySeries(klines3m)
+	// 计算日内系列数据（传入标记价格用于更新最后一个数据点）
+	intradayData := calculateIntradaySeries(klines3m, markPrice)
 
 	// 计算长期数据
 	longerTermData := calculateLongerTermData(klines4h)
@@ -387,7 +398,8 @@ func calculateATR(klines []Kline, period int) float64 {
 }
 
 // calculateIntradaySeries 计算日内系列数据
-func calculateIntradaySeries(klines []Kline) *IntradayData {
+// markPrice: 当前标记价格，用于更新最后一个数据点
+func calculateIntradaySeries(klines []Kline, markPrice float64) *IntradayData {
 	data := &IntradayData{
 		MidPrices:   make([]float64, 0, 10),
 		EMA20Values: make([]float64, 0, 10),
@@ -403,7 +415,12 @@ func calculateIntradaySeries(klines []Kline) *IntradayData {
 	}
 
 	for i := start; i < len(klines); i++ {
-		data.MidPrices = append(data.MidPrices, klines[i].Close)
+		// 对于最后一个数据点，使用标记价格；其他使用收盘价
+		price := klines[i].Close
+		if i == len(klines)-1 && markPrice > 0 {
+			price = markPrice
+		}
+		data.MidPrices = append(data.MidPrices, price)
 
 		// 计算每个点的EMA20
 		if i >= 19 {
@@ -651,6 +668,113 @@ func getHyperliquidOpenInterestData(symbol string) (*OIData, error) {
 	}, nil
 }
 
+// getMarkPrice 获取标记价格
+// 目前支持Binance，Hyperliquid等交易所获取失败时会回退到收盘价
+func getMarkPrice(symbol string, exchange string) (float64, error) {
+	// 对于Binance，使用premiumIndex API获取标记价格
+	if exchange == "binance" || exchange == "" {
+		url := fmt.Sprintf("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=%s", symbol)
+
+		resp, err := http.Get(url)
+		if err != nil {
+			return 0, err
+		}
+		defer resp.Body.Close()
+
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return 0, err
+		}
+
+		var result struct {
+			Symbol          string `json:"symbol"`
+			MarkPrice       string `json:"markPrice"`
+			IndexPrice      string `json:"indexPrice"`
+			LastFundingRate string `json:"lastFundingRate"`
+			NextFundingTime int64  `json:"nextFundingTime"`
+			InterestRate    string `json:"interestRate"`
+			Time            int64  `json:"time"`
+		}
+
+		if err := json.Unmarshal(body, &result); err != nil {
+			return 0, err
+		}
+
+		markPrice, err := strconv.ParseFloat(result.MarkPrice, 64)
+		if err != nil {
+			return 0, err
+		}
+		return markPrice, nil
+	}
+
+	// 对于Hyperliquid，使用AllMids API获取中间价作为标记价格的替代
+	if exchange == "hyperliquid" {
+		return getHyperliquidMarkPrice(symbol)
+	}
+
+	// 对于其他交易所（如Aster），目前不支持直接获取标记价格
+	// 返回错误，让调用方回退到使用收盘价
+	if exchange == "aster" {
+		return 0, fmt.Errorf("交易所 %s 暂不支持获取标记价格", exchange)
+	}
+
+	return 0, fmt.Errorf("不支持的交易所: %s", exchange)
+}
+
+// getHyperliquidMarkPrice 从Hyperliquid API获取标记价格（使用AllMids作为替代）
+// 参考: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api
+// 注意: Hyperliquid没有直接的标记价格API，使用allMids获取中间价作为替代
+func getHyperliquidMarkPrice(symbol string) (float64, error) {
+	// 将symbol转换为Hyperliquid格式（去掉USDT后缀）
+	// 例如: ETHUSDT -> ETH, BTCUSDT -> BTC
+	coin := strings.TrimSuffix(strings.ToUpper(symbol), "USDT")
+
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	// 使用AllMids API获取所有币种的中间价
+	requestBody := map[string]string{
+		"type": "allMids",
+	}
+	jsonData, err := json.Marshal(requestBody)
+	if err != nil {
+		return 0, fmt.Errorf("构建请求体失败: %w", err)
+	}
+
+	resp, err := client.Post("https://api.hyperliquid.xyz/info", "application/json", strings.NewReader(string(jsonData)))
+	if err != nil {
+		return 0, fmt.Errorf("请求Hyperliquid价格API失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return 0, fmt.Errorf("读取Hyperliquid价格响应失败: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("Hyperliquid价格API返回错误 (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	// 解析响应：AllMids返回的是map[string]string，键是币种名，值是价格字符串
+	var allMids map[string]string
+	if err := json.Unmarshal(body, &allMids); err != nil {
+		return 0, fmt.Errorf("Hyperliquid价格JSON解析失败: %w", err)
+	}
+
+	// 查找对应币种的价格
+	if priceStr, ok := allMids[coin]; ok {
+		price, err := strconv.ParseFloat(priceStr, 64)
+		if err != nil {
+			return 0, fmt.Errorf("价格格式错误: %w", err)
+		}
+		return price, nil
+	}
+
+	return 0, fmt.Errorf("未找到 %s 的价格", symbol)
+}
+
 // getFundingRate 获取资金费率
 func getFundingRate(symbol string) (float64, error) {
 	url := fmt.Sprintf("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=%s", symbol)
@@ -688,7 +812,7 @@ func getFundingRate(symbol string) (float64, error) {
 func Format(data *Data, isPosition bool) string {
 	var sb strings.Builder
 
-	sb.WriteString(fmt.Sprintf("当前价格 = %.2f, EMA20 = %.3f, MACD = %.3f, RSI(7) = %.3f\n\n",
+	sb.WriteString(fmt.Sprintf("当前价格（标记价格）= %.2f, EMA20 = %.3f, MACD = %.3f, RSI(7) = %.3f\n\n",
 		data.CurrentPrice, data.CurrentEMA20, data.CurrentMACD, data.CurrentRSI7))
 
 	sb.WriteString(fmt.Sprintf("以下为 %s 的持仓量与资金费率信息:\n\n",
@@ -734,7 +858,7 @@ func Format(data *Data, isPosition bool) string {
 		sb.WriteString("3分钟级别序列（从旧到新）:\n\n")
 
 		if len(data.IntradaySeries.MidPrices) > 0 {
-			sb.WriteString(fmt.Sprintf("收盘价序列: %s\n\n", formatFloatSlice(data.IntradaySeries.MidPrices)))
+			sb.WriteString(fmt.Sprintf("价格序列（标记价格）: %s\n\n", formatFloatSlice(data.IntradaySeries.MidPrices)))
 		}
 
 		if len(data.IntradaySeries.EMA20Values) > 0 {
@@ -775,91 +899,101 @@ func Format(data *Data, isPosition bool) string {
 		}
 	}
 
-	// 显示K线数据（供AI自己分析支撑阻力位）
-	sb.WriteString("K线数据（供分析支撑/阻力位）:\n\n")
-
-	// 优化策略：根据是否为持仓币种决定显示策略以节省tokens
-	// 持仓币种：显示所有周期（15m, 1h, 4h, 12h, 1d），每个周期100根，格式：时间戳|开|高|低|收|成交量
-	// 候选币种：显示关键周期（15m, 1h, 4h, 1d），每个周期100根，格式：时间戳|开|高|低|收|成交量
-	var klineCount int
-	var show15m, show12h bool
-
-	if isPosition {
-		klineCount = 100 // 持仓币种显示100根
-		show15m = true
-		show12h = true
+	// 优先使用K线分析缓存（如果可用）
+	analysis := GetKlineAnalysis(data.Symbol)
+	if analysis != nil {
+		// 使用缓存的分析结果（节省tokens）
+		log.Printf("✅ 使用 %s 的K线分析缓存（分析时间：%s）", data.Symbol, analysis.Timestamp.Format("2006-01-02 15:04:05"))
+		sb.WriteString(FormatKlineAnalysis(data.Symbol, data, isPosition))
 	} else {
-		klineCount = 100 // 候选币种显示100根
-		show15m = true   // 候选币种也显示15分钟K线
-		show12h = false
-	}
+		// 回退到显示原始K线数据（兼容模式）
+		log.Printf("⚠️ %s 的K线分析缓存不存在或已过期，使用原始K线数据", data.Symbol)
+		sb.WriteString("K线数据（供分析支撑/阻力位）:\n\n")
 
-	if show15m && len(data.Klines15m) > 0 {
-		sb.WriteString(fmt.Sprintf("[15分钟K线] 最近%d根（格式：时间戳|开|高|低|收|成交量）:\n", klineCount))
-		start := len(data.Klines15m) - klineCount
-		if start < 0 {
-			start = 0
-		}
-		for i := start; i < len(data.Klines15m); i++ {
-			k := data.Klines15m[i]
-			sb.WriteString(fmt.Sprintf("  %d|%.4f|%.4f|%.4f|%.4f|%.2f\n", k.OpenTime, k.Open, k.High, k.Low, k.Close, k.Volume))
-		}
-		sb.WriteString("\n")
-	}
+		// 优化策略：根据是否为持仓币种决定显示策略以节省tokens
+		// 持仓币种：显示所有周期（15m, 1h, 4h, 12h, 1d），每个周期100根，格式：时间戳|开|高|低|收|成交量
+		// 候选币种：显示关键周期（15m, 1h, 4h, 1d），每个周期100根，格式：时间戳|开|高|低|收|成交量
+		var klineCount int
+		var show15m, show12h bool
 
-	if len(data.Klines1h) > 0 {
-		sb.WriteString(fmt.Sprintf("[1小时K线] 最近%d根（格式：时间戳|开|高|低|收|成交量）:\n", klineCount))
-		start := len(data.Klines1h) - klineCount
-		if start < 0 {
-			start = 0
+		if isPosition {
+			klineCount = 100 // 持仓币种显示100根
+			show15m = true
+			show12h = true
+		} else {
+			klineCount = 100 // 候选币种显示100根
+			show15m = true   // 候选币种也显示15分钟K线
+			show12h = false
 		}
-		for i := start; i < len(data.Klines1h); i++ {
-			k := data.Klines1h[i]
-			sb.WriteString(fmt.Sprintf("  %d|%.4f|%.4f|%.4f|%.4f|%.2f\n", k.OpenTime, k.Open, k.High, k.Low, k.Close, k.Volume))
-		}
-		sb.WriteString("\n")
-	}
 
-	if len(data.Klines4h) > 0 {
-		sb.WriteString(fmt.Sprintf("[4小时K线] 最近%d根（格式：时间戳|开|高|低|收|成交量）:\n", klineCount))
-		start := len(data.Klines4h) - klineCount
-		if start < 0 {
-			start = 0
+		if show15m && len(data.Klines15m) > 0 {
+			sb.WriteString(fmt.Sprintf("[15分钟K线] 最近%d根（格式：时间戳|开|高|低|收|成交量）:\n", klineCount))
+			start := len(data.Klines15m) - klineCount
+			if start < 0 {
+				start = 0
+			}
+			for i := start; i < len(data.Klines15m); i++ {
+				k := data.Klines15m[i]
+				sb.WriteString(fmt.Sprintf("  %d|%.4f|%.4f|%.4f|%.4f|%.2f\n", k.OpenTime, k.Open, k.High, k.Low, k.Close, k.Volume))
+			}
+			sb.WriteString("\n")
 		}
-		for i := start; i < len(data.Klines4h); i++ {
-			k := data.Klines4h[i]
-			sb.WriteString(fmt.Sprintf("  %d|%.4f|%.4f|%.4f|%.4f|%.2f\n", k.OpenTime, k.Open, k.High, k.Low, k.Close, k.Volume))
-		}
-		sb.WriteString("\n")
-	}
 
-	if show12h && len(data.Klines12h) > 0 {
-		sb.WriteString(fmt.Sprintf("[12小时K线] 最近%d根（格式：时间戳|开|高|低|收|成交量）:\n", klineCount))
-		start := len(data.Klines12h) - klineCount
-		if start < 0 {
-			start = 0
+		if len(data.Klines1h) > 0 {
+			sb.WriteString(fmt.Sprintf("[1小时K线] 最近%d根（格式：时间戳|开|高|低|收|成交量）:\n", klineCount))
+			start := len(data.Klines1h) - klineCount
+			if start < 0 {
+				start = 0
+			}
+			for i := start; i < len(data.Klines1h); i++ {
+				k := data.Klines1h[i]
+				sb.WriteString(fmt.Sprintf("  %d|%.4f|%.4f|%.4f|%.4f|%.2f\n", k.OpenTime, k.Open, k.High, k.Low, k.Close, k.Volume))
+			}
+			sb.WriteString("\n")
 		}
-		for i := start; i < len(data.Klines12h); i++ {
-			k := data.Klines12h[i]
-			sb.WriteString(fmt.Sprintf("  %d|%.4f|%.4f|%.4f|%.4f|%.2f\n", k.OpenTime, k.Open, k.High, k.Low, k.Close, k.Volume))
-		}
-		sb.WriteString("\n")
-	}
 
-	if len(data.Klines1d) > 0 {
-		sb.WriteString(fmt.Sprintf("[1日K线] 最近%d根（格式：时间戳|开|高|低|收|成交量）:\n", klineCount))
-		start := len(data.Klines1d) - klineCount
-		if start < 0 {
-			start = 0
+		if len(data.Klines4h) > 0 {
+			sb.WriteString(fmt.Sprintf("[4小时K线] 最近%d根（格式：时间戳|开|高|低|收|成交量）:\n", klineCount))
+			start := len(data.Klines4h) - klineCount
+			if start < 0 {
+				start = 0
+			}
+			for i := start; i < len(data.Klines4h); i++ {
+				k := data.Klines4h[i]
+				sb.WriteString(fmt.Sprintf("  %d|%.4f|%.4f|%.4f|%.4f|%.2f\n", k.OpenTime, k.Open, k.High, k.Low, k.Close, k.Volume))
+			}
+			sb.WriteString("\n")
 		}
-		for i := start; i < len(data.Klines1d); i++ {
-			k := data.Klines1d[i]
-			sb.WriteString(fmt.Sprintf("  %d|%.4f|%.4f|%.4f|%.4f|%.2f\n", k.OpenTime, k.Open, k.High, k.Low, k.Close, k.Volume))
-		}
-		sb.WriteString("\n")
-	}
 
-	sb.WriteString("⚠️ 重要提示: 请根据K线数据自行分析支撑/阻力位，识别哪些阻力位已经突破转为支撑，哪些支撑位已经跌破转为阻力。\n\n")
+		if show12h && len(data.Klines12h) > 0 {
+			sb.WriteString(fmt.Sprintf("[12小时K线] 最近%d根（格式：时间戳|开|高|低|收|成交量）:\n", klineCount))
+			start := len(data.Klines12h) - klineCount
+			if start < 0 {
+				start = 0
+			}
+			for i := start; i < len(data.Klines12h); i++ {
+				k := data.Klines12h[i]
+				sb.WriteString(fmt.Sprintf("  %d|%.4f|%.4f|%.4f|%.4f|%.2f\n", k.OpenTime, k.Open, k.High, k.Low, k.Close, k.Volume))
+			}
+			sb.WriteString("\n")
+		}
+
+		if len(data.Klines1d) > 0 {
+			sb.WriteString(fmt.Sprintf("[1日K线] 最近%d根（格式：时间戳|开|高|低|收|成交量）:\n", klineCount))
+			start := len(data.Klines1d) - klineCount
+			if start < 0 {
+				start = 0
+			}
+			for i := start; i < len(data.Klines1d); i++ {
+				k := data.Klines1d[i]
+				sb.WriteString(fmt.Sprintf("  %d|%.4f|%.4f|%.4f|%.4f|%.2f\n", k.OpenTime, k.Open, k.High, k.Low, k.Close, k.Volume))
+			}
+			sb.WriteString("\n")
+		}
+
+		sb.WriteString("⚠️ 重要提示: 请根据K线数据自行分析支撑/阻力位，识别哪些阻力位已经突破转为支撑，哪些支撑位已经跌破转为阻力。\n\n")
+		sb.WriteString("💡 提示: K线分析缓存正在准备中，完成后将自动使用缓存的分析结果以节省tokens。\n\n")
+	}
 
 	return sb.String()
 }

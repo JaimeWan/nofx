@@ -220,9 +220,10 @@ func (t *HyperliquidTrader) OpenLong(symbol string, quantity float64, leverage i
 	roundedQuantity := t.roundToSzDecimals(coin, quantity)
 	log.Printf("  📏 数量精度处理: %.8f -> %.8f (szDecimals=%d)", quantity, roundedQuantity, t.getSzDecimals(coin))
 
-	// ⚠️ 关键：价格也需要处理为5位有效数字
-	aggressivePrice := t.roundPriceToSigfigs(price * 1.01)
-	log.Printf("  💰 价格精度处理: %.8f -> %.8f (5位有效数字)", price*1.01, aggressivePrice)
+	// ⚠️ 关键：计算动态价格缓冲（默认0.5%，根据市场情况可调整至0.75%）
+	priceBuffer := t.calculatePriceBuffer(symbol, price, true)
+	aggressivePrice := t.roundPriceToSigfigs(price * (1.0 + priceBuffer))
+	log.Printf("  💰 价格精度处理: %.8f -> %.8f (缓冲%.2f%%, 5位有效数字)", price, aggressivePrice, priceBuffer*100)
 
 	// 创建市价买入订单（使用IOC limit order with aggressive price）
 	order := hyperliquid.CreateOrderRequest{
@@ -278,9 +279,10 @@ func (t *HyperliquidTrader) OpenShort(symbol string, quantity float64, leverage 
 	roundedQuantity := t.roundToSzDecimals(coin, quantity)
 	log.Printf("  📏 数量精度处理: %.8f -> %.8f (szDecimals=%d)", quantity, roundedQuantity, t.getSzDecimals(coin))
 
-	// ⚠️ 关键：价格也需要处理为5位有效数字
-	aggressivePrice := t.roundPriceToSigfigs(price * 0.99)
-	log.Printf("  💰 价格精度处理: %.8f -> %.8f (5位有效数字)", price*0.99, aggressivePrice)
+	// ⚠️ 关键：计算动态价格缓冲（默认0.5%，根据市场情况可调整至0.75%）
+	priceBuffer := t.calculatePriceBuffer(symbol, price, false)
+	aggressivePrice := t.roundPriceToSigfigs(price * (1.0 - priceBuffer))
+	log.Printf("  💰 价格精度处理: %.8f -> %.8f (缓冲%.2f%%, 5位有效数字)", price, aggressivePrice, priceBuffer*100)
 
 	// 创建市价卖出订单
 	order := hyperliquid.CreateOrderRequest{
@@ -345,9 +347,15 @@ func (t *HyperliquidTrader) CloseLong(symbol string, quantity float64) (map[stri
 	roundedQuantity := t.roundToSzDecimals(coin, quantity)
 	log.Printf("  📏 数量精度处理: %.8f -> %.8f (szDecimals=%d)", quantity, roundedQuantity, t.getSzDecimals(coin))
 
-	// ⚠️ 关键：价格也需要处理为5位有效数字
-	aggressivePrice := t.roundPriceToSigfigs(price * 0.99)
-	log.Printf("  💰 价格精度处理: %.8f -> %.8f (5位有效数字)", price*0.99, aggressivePrice)
+	// ⚠️ 关键：计算动态价格缓冲（平仓时使用较小缓冲0.3%，确保快速成交）
+	priceBuffer := t.calculatePriceBuffer(symbol, price, false)
+	// 平仓时使用更小的缓冲，确保尽快成交
+	closeBuffer := priceBuffer * 0.6 // 平仓缓冲约为开仓缓冲的60%
+	if closeBuffer < 0.003 {
+		closeBuffer = 0.003 // 最小0.3%
+	}
+	aggressivePrice := t.roundPriceToSigfigs(price * (1.0 - closeBuffer))
+	log.Printf("  💰 价格精度处理: %.8f -> %.8f (平仓缓冲%.2f%%, 5位有效数字)", price, aggressivePrice, closeBuffer*100)
 
 	// 创建平仓订单（卖出 + ReduceOnly）
 	order := hyperliquid.CreateOrderRequest{
@@ -417,9 +425,15 @@ func (t *HyperliquidTrader) CloseShort(symbol string, quantity float64) (map[str
 	roundedQuantity := t.roundToSzDecimals(coin, quantity)
 	log.Printf("  📏 数量精度处理: %.8f -> %.8f (szDecimals=%d)", quantity, roundedQuantity, t.getSzDecimals(coin))
 
-	// ⚠️ 关键：价格也需要处理为5位有效数字
-	aggressivePrice := t.roundPriceToSigfigs(price * 1.01)
-	log.Printf("  💰 价格精度处理: %.8f -> %.8f (5位有效数字)", price*1.01, aggressivePrice)
+	// ⚠️ 关键：计算动态价格缓冲（平仓时使用较小缓冲0.3%，确保快速成交）
+	priceBuffer := t.calculatePriceBuffer(symbol, price, true)
+	// 平仓时使用更小的缓冲，确保尽快成交
+	closeBuffer := priceBuffer * 0.6 // 平仓缓冲约为开仓缓冲的60%
+	if closeBuffer < 0.003 {
+		closeBuffer = 0.003 // 最小0.3%
+	}
+	aggressivePrice := t.roundPriceToSigfigs(price * (1.0 + closeBuffer))
+	log.Printf("  💰 价格精度处理: %.8f -> %.8f (平仓缓冲%.2f%%, 5位有效数字)", price, aggressivePrice, closeBuffer*100)
 
 	// 创建平仓订单（买入 + ReduceOnly）
 	order := hyperliquid.CreateOrderRequest{
@@ -615,6 +629,35 @@ func (t *HyperliquidTrader) roundToSzDecimals(coin string, quantity float64) flo
 
 	// 四舍五入
 	return float64(int(quantity*multiplier+0.5)) / multiplier
+}
+
+// calculatePriceBuffer 计算动态价格缓冲百分比
+// 默认0.5%，根据市场波动情况可动态调整至0.75%
+// isBuy: true=买入(需要提高价格), false=卖出(需要降低价格)
+func (t *HyperliquidTrader) calculatePriceBuffer(symbol string, price float64, isBuy bool) float64 {
+	// 基础缓冲：0.5%
+	baseBuffer := 0.005
+
+	// TODO: 可以根据市场数据动态调整缓冲
+	// 例如：
+	// - 根据最近的价格波动率（ATR）调整
+	// - 根据买卖盘价差调整
+	// - 根据成交量调整
+	// 目前使用固定的0.5%，后续可以增强为动态调整
+
+	// 确保缓冲在合理范围内：0.3% - 0.75%
+	minBuffer := 0.003
+	maxBuffer := 0.0075
+
+	buffer := baseBuffer
+	if buffer < minBuffer {
+		buffer = minBuffer
+	}
+	if buffer > maxBuffer {
+		buffer = maxBuffer
+	}
+
+	return buffer
 }
 
 // roundPriceToSigfigs 将价格四舍五入到5位有效数字
